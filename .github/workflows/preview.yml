@@ -1,0 +1,95 @@
+name: preview
+
+# Publishes PR / branch images to ghcr.io under non-semver tags so
+# changes can be demoed BEFORE merge. Never tags as `latest` and never
+# overrides a real release. Only runs for PRs from this repo (not forks)
+# to avoid leaking GITHUB_TOKEN write permissions to untrusted PRs.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / SHA to build"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+jobs:
+  build-and-push:
+    # Skip forks (no write tokens) and gate behind a `preview` label on PRs
+    # so we don't burn CI minutes on every push.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'preview'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.event.pull_request.head.sha }}
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute preview tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "tag=pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "sha_tag=pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          else
+            REF="${{ github.event.inputs.ref }}"
+            SAFE="$(echo "$REF" | tr '/' '-' | tr -cd '[:alnum:]._-')"
+            echo "tag=preview-${SAFE}" >> "$GITHUB_OUTPUT"
+            echo "sha_tag=preview-${SAFE}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push (single-arch for speed)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ steps.tag.outputs.tag }}';
+            const shaTag = '${{ steps.tag.outputs.sha_tag }}';
+            const body = [
+              '🔬 **Preview image published**',
+              '',
+              '```',
+              `docker pull ghcr.io/${context.repo.owner}/${context.repo.repo}:${tag}`,
+              `docker pull ghcr.io/${context.repo.owner}/${context.repo.repo}:${shaTag}`,
+              '```',
+              '',
+              '_Preview tags are linux/amd64 only and are NOT tagged as `latest`._',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

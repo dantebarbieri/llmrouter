@@ -10,7 +10,35 @@ permissions:
   packages: write
 
 jobs:
+  guard:
+    # Only release tags whose commit is reachable from origin/main.
+    # This prevents pushing a tag from a feature branch and shipping an
+    # unmerged commit to ghcr.io / :latest.
+    runs-on: ubuntu-latest
+    outputs:
+      on_main: ${{ steps.check.outputs.on_main }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Verify tag commit is on main
+        id: check
+        run: |
+          set -euo pipefail
+          TAG_SHA="${GITHUB_SHA}"
+          git fetch origin main --depth=200
+          if git merge-base --is-ancestor "$TAG_SHA" origin/main; then
+            echo "on_main=true" >> "$GITHUB_OUTPUT"
+            echo "Tag commit $TAG_SHA is reachable from origin/main — proceeding."
+          else
+            echo "on_main=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Tag commit $TAG_SHA is NOT on origin/main. Refusing to release."
+            echo "Tags must be pushed only from main (after PR merge)."
+            exit 1
+          fi
+
   build-and-push:
+    needs: guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
