@@ -496,6 +496,7 @@ function saveHash() {
   if (f.hasSecret !== null) h.set("has_secret", String(f.hasSecret));
   if (f.isStream !== null)  h.set("is_stream", String(f.isStream));
   if (f.slow)               h.set("slow", "1");
+  if (f.originatingOnly)    h.set("orig_only", "1");
   if (f.since)              h.set("since", f.since);
   if (f.customSince)        h.set("custom_since", f.customSince);
   if (f.customUntil)        h.set("custom_until", f.customUntil);
@@ -514,6 +515,7 @@ function loadHash() {
   f.hasSecret = h.has("has_secret") ? parseInt(h.get("has_secret")) : null;
   f.isStream  = h.has("is_stream")  ? parseInt(h.get("is_stream"))  : null;
   f.slow      = h.get("slow") === "1";
+  f.originatingOnly = h.get("orig_only") === "1";
   f.since     = h.get("since") || "";
   f.customSince = h.get("custom_since") || "";
   f.customUntil = h.get("custom_until") || "";
@@ -560,6 +562,7 @@ function matchesFilters(item) {
   if (f.isStream === 1  && !item.is_stream)         return false;
   if (f.isStream === 0  &&  item.is_stream)         return false;
   if (f.slow && (item.duration_ms || 0) < SLOW_REQ_MS) return false;
+  if (f.originatingOnly && item.thread_role === "subcall") return false;
   // Time filter: only apply the lower bound client-side; the server applies
   // the exact bound on the next full refresh.
   if (f.since && f.since !== "custom") {
@@ -602,7 +605,7 @@ function renderStats() {
   ).join("");
 }
 
-function rowHtml(r) {
+function rowHtml(r, opts = {}) {
   const secret = r.secret_keyword ? "secret" : "";
   const snippet = r.snippet
     ? r.snippet
@@ -616,17 +619,58 @@ function rowHtml(r) {
     r.fallback_applied ? "fallback" : null,
     r.local_complexity != null ? "local=" + r.local_complexity : null,
     r.tiebreaker_digit ? "haiku=" + r.tiebreaker_digit : null,
+    r.parent_tier && r.thread_role === "subcall" ? "parent=" + r.parent_tier : null,
   ].filter(Boolean).join(" · ");
+  // Threading classes / chip:
+  const threadClass = state.threadView && r.thread_role
+    ? (r.thread_role === "subcall" ? "subcall" : "originating")
+    : "";
+  let threadChip = "";
+  if (state.threadView && r.thread_role === "originating" && opts.subcallCount) {
+    const expanded = state.expandedThreads.has(r.thread_id);
+    threadChip = ` <span class="thread-chip${expanded ? " expanded" : ""}" data-thread="${escapeHtml(r.thread_id)}" title="${expanded ? "collapse" : "expand"} ${opts.subcallCount} sub-call${opts.subcallCount === 1 ? "" : "s"}">${expanded ? "▾" : "▸"} ${opts.subcallCount} sub-call${opts.subcallCount === 1 ? "" : "s"}</span>`;
+  }
   return `
-    <div class="row ${secret} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+    <div class="row ${secret} ${threadClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
       <div class="time" title="${escapeHtml(fmtTime(r.ts))}">${relTime(r.ts)} ago</div>
       <div>${tierChip(r.tier)}<div class="meta">${escapeHtml(r.reason || "")}</div></div>
       <div>
-        <div class="snippet">${escapeHtml(snippet)}</div>
+        <div class="snippet">${escapeHtml(snippet)}${threadChip}</div>
         <div class="meta">${escapeHtml(meta)}</div>
       </div>
       <div class="meta">#${r.id}</div>
     </div>`;
+}
+
+// Group rows for tree-view rendering: each originating row carries its
+// sub-calls inline (only shown when expanded). Sub-calls without a visible
+// originating row in the current view are shown standalone (so filters that
+// hide the parent don't make sub-calls disappear).
+function buildTreeView(visible) {
+  const byThread = new Map(); // thread_id -> { originating, subcalls: [] }
+  const orphanSubcalls = [];
+  const order = [];           // ordered list of {kind:"orig"|"orphan", item, group?}
+  for (const r of visible) {
+    if (!r.thread_id || !state.threadView) {
+      order.push({ kind: "single", item: r });
+      continue;
+    }
+    if (r.thread_role === "originating") {
+      const grp = { originating: r, subcalls: [] };
+      byThread.set(r.thread_id, grp);
+      order.push({ kind: "orig", item: r, group: grp });
+    } else if (r.thread_role === "subcall") {
+      const grp = byThread.get(r.thread_id);
+      if (grp) {
+        grp.subcalls.push(r);
+      } else {
+        order.push({ kind: "single", item: r });
+      }
+    } else {
+      order.push({ kind: "single", item: r });
+    }
+  }
+  return order;
 }
 
 function renderRows() {
@@ -641,9 +685,40 @@ function renderRows() {
   }
   summary.textContent = visible.length + " request" + (visible.length === 1 ? "" : "s")
     + (visible.length !== state.rows.length ? ` (of ${state.rows.length} loaded)` : "");
-  rowsEl.innerHTML = visible.map(rowHtml).join("");
+  let html;
+  if (state.threadView) {
+    const tree = buildTreeView(visible);
+    const parts = [];
+    for (const node of tree) {
+      if (node.kind === "orig") {
+        parts.push(rowHtml(node.item, { subcallCount: node.group.subcalls.length }));
+        if (state.expandedThreads.has(node.item.thread_id)) {
+          for (const sub of node.group.subcalls) parts.push(rowHtml(sub));
+        }
+      } else {
+        parts.push(rowHtml(node.item));
+      }
+    }
+    html = parts.join("");
+  } else {
+    html = visible.map(r => rowHtml(r)).join("");
+  }
+  rowsEl.innerHTML = html;
   for (const el of rowsEl.querySelectorAll(".row")) {
-    el.onclick = () => selectRow(parseInt(el.dataset.id));
+    el.onclick = (ev) => {
+      // Don't trigger select when clicking the thread chip.
+      if (ev.target.classList.contains("thread-chip")) return;
+      selectRow(parseInt(el.dataset.id));
+    };
+  }
+  for (const chip of rowsEl.querySelectorAll(".thread-chip")) {
+    chip.onclick = (ev) => {
+      ev.stopPropagation();
+      const tid = chip.dataset.thread;
+      if (state.expandedThreads.has(tid)) state.expandedThreads.delete(tid);
+      else state.expandedThreads.add(tid);
+      renderRows();
+    };
   }
   renderStats();
 }
@@ -759,6 +834,19 @@ function renderDetail(r) {
   const deleteLabel = r.secret_keyword ? "Delete (contains secret)" : "Delete";
   const deleteClass = r.secret_keyword ? "delete-btn secret" : "delete-btn";
 
+  const threadingSection = r.thread_id ? `
+    <div class="section">
+      <h3>Threading</h3>
+      <div class="kv">
+        ${kv("role", `<code>${escapeHtml(r.thread_role || "—")}</code>`)}
+        ${kv("thread_id", `<code style="word-break:break-all">${escapeHtml(r.thread_id)}</code>`)}
+        ${r.origin_request_id ? kv("origin", `<a href="#" data-jump="${r.origin_request_id}">#${r.origin_request_id}</a>`) : ""}
+        ${r.parent_tier ? kv("parent tier", tierChip(r.parent_tier)) : ""}
+        ${r.parent_complexity != null ? kv("parent complexity", `<b>${r.parent_complexity}</b>`) : ""}
+      </div>
+    </div>
+  ` : "";
+
   document.getElementById("detail").innerHTML = `
     <h2>Request #${r.id} ${tierChip(r.tier)}</h2>
     <div class="kv">
@@ -771,6 +859,8 @@ function renderDetail(r) {
       ${kv("stream", r.is_stream ? "yes" : "no")}
       ${kv("fallback", r.fallback_applied ? '<span class="err">yes (ollama unreachable)</span>' : "no")}
     </div>
+
+    ${threadingSection}
 
     <div class="section">
       <h3>Classification signals</h3>
@@ -809,6 +899,12 @@ function renderDetail(r) {
       state.filters.q = el.dataset.kw;
       saveHash();
       refreshAll();
+    };
+  });
+  document.querySelectorAll("#detail a[data-jump]").forEach(el => {
+    el.onclick = (ev) => {
+      ev.preventDefault();
+      selectRow(parseInt(el.dataset.jump));
     };
   });
   document.getElementById("detail-delete").onclick = () => deleteSelected(r);
@@ -1077,6 +1173,7 @@ function clearFilters() {
     q: "", tiers: new Set(), reasons: new Set(),
     fallback: null, hasSecret: null, isStream: null,
     slow: false, since: "", customSince: "", customUntil: "",
+    originatingOnly: false,
   };
   document.getElementById("q").value = "";
   document.getElementById("since").value = "";
@@ -1084,11 +1181,20 @@ function clearFilters() {
   document.getElementById("custom-until").value = "";
   document.getElementById("custom-since").classList.add("hide");
   document.getElementById("custom-until").classList.add("hide");
+  state.expandedThreads.clear();
   renderTierOptions();
   renderReasonOptions();
   renderToggles();
+  renderThreadingToggles();
   saveHash();
   refreshList();
+}
+
+function renderThreadingToggles() {
+  const tv = document.getElementById("thread-view-toggle");
+  const oo = document.getElementById("originating-only-toggle");
+  if (tv) tv.classList.toggle("active", !!state.threadView);
+  if (oo) oo.classList.toggle("active", !!state.filters.originatingOnly);
 }
 
 // --- wire events ---
@@ -1104,6 +1210,20 @@ document.getElementById("logout").addEventListener("click", logout);
 document.getElementById("filter-clear").addEventListener("click", clearFilters);
 document.getElementById("login-go").addEventListener("click", tryUnlock);
 document.getElementById("login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryUnlock(); });
+
+document.getElementById("thread-view-toggle").addEventListener("click", () => {
+  state.threadView = !state.threadView;
+  if (!state.threadView) state.expandedThreads.clear();
+  renderThreadingToggles();
+  renderRows();
+});
+document.getElementById("originating-only-toggle").addEventListener("click", () => {
+  state.filters.originatingOnly = !state.filters.originatingOnly;
+  renderThreadingToggles();
+  saveHash();
+  renderRows();
+});
+renderThreadingToggles();
 
 // Ticks: keep relative timestamps + stale-cache note fresh
 setInterval(() => {

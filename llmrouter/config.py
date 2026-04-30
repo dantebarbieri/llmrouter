@@ -210,6 +210,67 @@ class HysteresisSpec(BaseModel):
         return v
 
 
+class ThreadExtractorSpec(BaseModel):
+    """One regex extractor for thread-id derivation.
+
+    `pattern` MUST contain exactly one capture group. The captured text is
+    used as the thread key (with the extractor name as source prefix).
+    """
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+    name: str
+    source: Literal["last_user_text"] = "last_user_text"
+    pattern: str
+    flags: tuple[str, ...] = ()
+    compiled: re.Pattern[str]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compile(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return v
+        v = dict(v)
+        flags = v.get("flags") or []
+        try:
+            compiled = re.compile(v["pattern"], _flags_to_int(list(flags)))
+        except re.error as e:
+            raise ValueError(
+                f"invalid regex for thread extractor {v.get('name')!r}: {e}"
+            ) from e
+        if compiled.groups != 1:
+            raise ValueError(
+                f"thread extractor {v.get('name')!r} must have exactly one "
+                f"capture group, got {compiled.groups}"
+            )
+        v["compiled"] = compiled
+        v["flags"] = tuple(flags)
+        return v
+
+
+class ThreadingSpec(BaseModel):
+    """Configuration for thread-aware UI + routing.
+
+    Disabled by default for backward compatibility. When `enabled=False`,
+    `_extract_thread_id` returns None and the rest of the threading code
+    paths are skipped.
+    """
+    model_config = ConfigDict(frozen=True)
+    enabled: bool = False
+    header_name: str = "x-llmrouter-thread-id"
+    ttl_s: float = 1800.0
+    parent_tier_policy: Literal["inform", "cap", "ignore"] = "inform"
+    classify_subcall_isolated: bool = True
+    adopt_sticky_pairs: bool = True
+    extractors: tuple[ThreadExtractorSpec, ...] = ()
+    fallback_hash: bool = True
+
+    @field_validator("extractors", mode="before")
+    @classmethod
+    def _to_tuple(cls, v: Any) -> tuple[Any, ...]:
+        if v is None:
+            return ()
+        return tuple(v)
+
+
 class LimitsSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
     health_ttl_s: float = 5.0
@@ -228,6 +289,7 @@ class Config(BaseModel):
     metadata_strip_patterns: tuple[MetadataStripSpec, ...] = ()
     hysteresis: HysteresisSpec
     limits: LimitsSpec
+    threading: ThreadingSpec = Field(default_factory=ThreadingSpec)
 
     @model_validator(mode="after")
     def _validate_tier_refs(self) -> Config:

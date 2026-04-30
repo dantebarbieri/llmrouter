@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -188,8 +189,13 @@ def heuristic_tier(body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     return CFG.classifier.heuristic_default_tier, signals
 
 
-async def haiku_tiebreaker(body: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    text = _messages_text(body.get("messages", []))[:4000]
+async def haiku_tiebreaker(
+    body: dict[str, Any],
+    classification_text: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    if classification_text is None:
+        classification_text = _messages_text(body.get("messages", []))
+    text = classification_text[:4000]
     rate_prompt = (
         "Rate the complexity of this request on a 1-5 scale. "
         "1=trivial factual, 2=simple generation, 3=moderate reasoning, "
@@ -375,9 +381,283 @@ def _record_tier(chat_id: str | None, tier: str, now: float) -> None:
         _LAST_TIER_BY_CHAT[chat_id] = (tier, now)
 
 
-async def local_classify(body: dict[str, Any]) -> tuple[bool, int, dict[str, Any]]:
+# --- thread-aware routing (issue #1) ---------------------------------------
+# Public-ish helpers (also unit-tested via tests/test_threading.py):
+#   _sanitize_header_thread_id  : header validation/normalization
+#   _extract_thread_id          : pure function, source-prefixed key
+#   _claim_thread_state         : admission-time race-safe parent lookup
+#   _record_thread_state        : commit thread state after routing decided
+#   _apply_parent_tier_policy   : enforce inform/cap/ignore policy
+#   _apply_thread_sticky        : per-thread sticky-pair downgrade
+#   _build_classification_text  : build sub-call-isolated prompt input
+
+_HEADER_BAD_CHAR_RE = re.compile(r"[^\w\-:.@$+/=]")
+
+# Process-local state cache: thread_id -> {
+#   origin_request_id, previous_request_id, previous_tier, previous_complexity, ts
+# }. Bounded only by `threading.ttl_s` eviction during access.
+_THREAD_STATE: dict[str, dict[str, Any]] = {}
+_THREAD_STATE_LOCK = asyncio.Lock()
+
+
+def _sanitize_header_thread_id(raw: str) -> str | None:
+    """Return a sanitized thread-id from a raw header value, or None.
+
+    Strips control chars, replaces non-safe chars with '_', caps at 128.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    cleaned = _HEADER_BAD_CHAR_RE.sub("_", raw)
+    cleaned = cleaned[:128]
+    return cleaned or None
+
+
+def _last_user_message_text(messages: list[dict[str, Any]]) -> str:
+    """Return the textual content of the most recent user-role message, or ''."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return _messages_text([m])
+    return ""
+
+
+def _trailing_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Last message in the array (any role), or None."""
+    for m in reversed(messages):
+        if m.get("role") in ("user", "assistant", "tool", "function", "system"):
+            return m
+    return messages[-1] if messages else None
+
+
+def _extract_thread_id(body: dict[str, Any], header_value: str | None) -> str | None:
+    """Compute the source-prefixed thread id for this request, or None.
+
+    Priority: header → extractor regex list (against the LAST user message
+    only) → fallback hash of (system prompt prefix, latest user prefix).
+    """
+    spec = CFG.threading
+    if not spec.enabled:
+        return None
+    if header_value:
+        cleaned = _sanitize_header_thread_id(header_value)
+        if cleaned:
+            return f"hdr:{cleaned}"
+    messages = body.get("messages") or []
+    last_user = _last_user_message_text(messages)
+    for ex in spec.extractors:
+        if ex.source != "last_user_text":
+            continue
+        m = ex.compiled.search(last_user)
+        if m and m.group(1):
+            return f"{ex.name}:{m.group(1)}"
+    if spec.fallback_hash:
+        sys_text = ""
+        for msg in messages:
+            if msg.get("role") == "system":
+                sys_text = _messages_text([msg])[:512]
+                break
+        digest = hashlib.sha256(
+            (sys_text + "\x1f" + last_user[:2048]).encode("utf-8", errors="replace")
+        ).hexdigest()[:24]
+        return f"fallback:{digest}"
+    return None
+
+
+def _lookup_thread_state_in_db(
+    thread_id: str, ttl: float, now: float,
+) -> dict[str, Any] | None:
+    """Find the most-recent same-thread row within ttl. Cold-cache fallback."""
+    if not ENV.log_requests:
+        return None
+    try:
+        _init_db()
+        conn = sqlite3.connect(ENV.db_path, check_same_thread=False, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT id, origin_request_id, tier, local_complexity, ts "
+                "FROM requests WHERE thread_id = ? AND ts >= ? "
+                "ORDER BY ts DESC LIMIT 1",
+                (thread_id, now - ttl),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "origin_request_id": row["origin_request_id"] or row["id"],
+                "previous_request_id": row["id"],
+                "previous_tier": row["tier"],
+                "previous_complexity": row["local_complexity"],
+                "ts": row["ts"],
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        LOG.debug("thread-state DB lookup failed: %s", e)
+        return None
+
+
+async def _claim_thread_state(thread_id: str, now: float) -> dict[str, Any]:
+    """Race-safe admission-time claim. Reserves a slot if cache is empty.
+
+    Returns:
+      {
+        is_originating: bool,
+        origin_request_id: int | None,
+        previous_request_id: int | None,
+        previous_tier: str | None,
+        previous_complexity: int | None,
+      }
+    """
+    spec = CFG.threading
+    ttl = float(spec.ttl_s)
+    async with _THREAD_STATE_LOCK:
+        cached = _THREAD_STATE.get(thread_id)
+        if cached and (now - cached.get("ts", 0.0)) <= ttl:
+            return {
+                "is_originating": False,
+                "origin_request_id": cached.get("origin_request_id"),
+                "previous_request_id": cached.get("previous_request_id"),
+                "previous_tier": cached.get("previous_tier"),
+                "previous_complexity": cached.get("previous_complexity"),
+            }
+        # Reserve the slot so a sibling arriving microseconds later sees us.
+        _THREAD_STATE[thread_id] = {
+            "origin_request_id": cached.get("origin_request_id") if cached else None,
+            "previous_request_id": cached.get("previous_request_id") if cached else None,
+            "previous_tier": None,
+            "previous_complexity": None,
+            "ts": now,
+        }
+    # Cache miss (cold or expired). Look in DB (no lock — async friendly).
+    db_state = await asyncio.to_thread(_lookup_thread_state_in_db, thread_id, ttl, now)
+    if db_state and (now - db_state["ts"]) <= ttl:
+        async with _THREAD_STATE_LOCK:
+            slot = _THREAD_STATE.get(thread_id)
+            if slot is not None:
+                slot.update({
+                    "origin_request_id": db_state["origin_request_id"],
+                    "previous_request_id": db_state["previous_request_id"],
+                    "previous_tier": db_state["previous_tier"],
+                    "previous_complexity": db_state["previous_complexity"],
+                })
+        return {
+            "is_originating": False,
+            "origin_request_id": db_state["origin_request_id"],
+            "previous_request_id": db_state["previous_request_id"],
+            "previous_tier": db_state["previous_tier"],
+            "previous_complexity": db_state["previous_complexity"],
+        }
+    return {
+        "is_originating": True,
+        "origin_request_id": None,
+        "previous_request_id": None,
+        "previous_tier": None,
+        "previous_complexity": None,
+    }
+
+
+def _record_thread_state(
+    thread_id: str | None,
+    origin_request_id: int | None,
+    previous_request_id: int | None,
+    tier: str | None,
+    complexity: int | None,
+    now: float,
+) -> None:
+    """Persist routing outcome for this thread so the next request inherits it."""
+    if not thread_id:
+        return
+    slot = _THREAD_STATE.get(thread_id)
+    if slot is None:
+        slot = {}
+        _THREAD_STATE[thread_id] = slot
+    slot["origin_request_id"] = origin_request_id
+    slot["previous_request_id"] = previous_request_id
+    slot["previous_tier"] = tier
+    slot["previous_complexity"] = complexity
+    slot["ts"] = now
+
+
+def _tier_rank(tier: str | None) -> int:
+    """Insertion-order rank from CFG.tiers. Unknown tiers get -1."""
+    if tier is None:
+        return -1
+    for i, name in enumerate(CFG.tiers.keys()):
+        if name == tier:
+            return i
+    return -1
+
+
+def _apply_parent_tier_policy(child_tier: str, parent_tier: str | None) -> str:
+    """Enforce parent_tier_policy from CFG.threading.
+
+    - inform / ignore: child unchanged.
+    - cap: child rank cannot exceed parent rank; if it would, drop to parent.
+    """
+    spec = CFG.threading
+    if not spec.enabled or spec.parent_tier_policy in ("inform", "ignore"):
+        return child_tier
+    if (
+        spec.parent_tier_policy == "cap"
+        and parent_tier
+        and _tier_rank(child_tier) > _tier_rank(parent_tier)
+    ):
+        return parent_tier
+    return child_tier
+
+
+def _apply_thread_sticky(
+    tier: str,
+    parent_state: dict[str, Any] | None,
+    now: float,  # noqa: ARG001 — kept for symmetry with _apply_hysteresis
+) -> str:
+    """Per-thread sticky_pairs adoption (mirrors `_apply_hysteresis`)."""
+    spec = CFG.threading
+    if not spec.enabled or not spec.adopt_sticky_pairs or not parent_state:
+        return tier
+    prev = parent_state.get("previous_tier")
+    if not prev:
+        return tier
+    for sp in CFG.hysteresis.sticky_pairs:
+        if prev == sp.from_prev and tier == sp.when_now:
+            return sp.keep
+    return tier
+
+
+def _build_classification_text(body: dict[str, Any], is_subcall: bool) -> str:
+    """Return the text fed into the local classifier.
+
+    For originating requests this is just the latest user message (cleaned).
+    For sub-calls, when `classify_subcall_isolated` is True, the text is
+    composed of the original user ask + the trailing message (role-labeled),
+    so the classifier scores the *current* sub-step rather than re-scoring
+    the original ask via a long history.
+    """
+    spec = CFG.threading
+    messages = body.get("messages") or []
+    user_text = _clean_user_text(_last_user_message_text(messages))
+    if not is_subcall or not spec.classify_subcall_isolated:
+        return user_text
+    trailing = _trailing_message(messages)
+    if trailing is None or trailing.get("role") == "user":
+        return user_text
+    trailing_text = _messages_text([trailing])
+    return (
+        f"Original user ask: {user_text}\n\n"
+        f"Current trailing message (role={trailing.get('role')}): {trailing_text}"
+    )
+
+
+async def local_classify(
+    body: dict[str, Any],
+    classification_text: str | None = None,
+) -> tuple[bool, int, dict[str, Any]]:
     """Ask the local model to classify the request. Returns (has_secret, complexity, details)."""
-    text = _clean_user_text(_latest_user_text(body.get("messages", [])))[:4000]
+    if classification_text is None:
+        classification_text = _clean_user_text(_latest_user_text(body.get("messages", [])))
+    text = classification_text[:4000]
     prompt = _CLASSIFIER_PROMPT_TEMPLATE.format(text=text)
     details: dict[str, Any] = {"prompt": prompt, "response": None, "error": None}
     try:
@@ -488,6 +768,20 @@ _REQUESTS_ADDED_COLUMNS: list[tuple[str, str]] = [
     ("local_complexity", "INTEGER"),
     ("local_secret", "INTEGER"),
     ("messages_full", "TEXT"),
+    # Threading (issue #1). All NULL when threading.enabled=false.
+    # `thread_id`: opaque source-prefixed key, e.g. `openclaw_message_id:$rus-...`
+    # or `fallback:<sha256>`. Indexed for thread-grouped queries.
+    ("thread_id", "TEXT"),
+    # `origin_request_id`: id of the originating row in the same thread.
+    # Equals the row's own id for originating rows. NULL when thread_id is NULL.
+    ("origin_request_id", "INTEGER"),
+    # `thread_role`: 'originating' | 'subcall'. NULL when thread_id is NULL.
+    ("thread_role", "TEXT"),
+    # Snapshot of the parent's local_complexity at routing time. Logged
+    # under all parent_tier_policy values (informational).
+    ("parent_complexity", "INTEGER"),
+    # Snapshot of the parent's tier at routing time.
+    ("parent_tier", "TEXT"),
 ]
 
 
@@ -561,6 +855,13 @@ def _init_db() -> None:
             END;
         """)
         _migrate_requests_schema(conn)
+        # Thread index — created post-migration so the column exists. IF NOT
+        # EXISTS makes this no-op on subsequent boots.
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_requests_thread_ts "
+                "ON requests(thread_id, ts DESC)"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -697,6 +998,9 @@ def search_requests(
                        requests.tiebreaker_digit, requests.classifier_source,
                        requests.local_complexity, requests.local_secret,
                        requests.keywords,
+                       requests.thread_id, requests.origin_request_id,
+                       requests.thread_role, requests.parent_complexity,
+                       requests.parent_tier,
                        substr(coalesce(requests.messages_preview, ''), 1, 240) AS snippet
                 FROM requests {joins}{where_sql}
                 ORDER BY requests.ts DESC
@@ -785,6 +1089,11 @@ def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
         "local_secret": row.get("local_secret"),
         "keywords": row.get("keywords"),
         "snippet": preview[:240] if preview else "",
+        "thread_id": row.get("thread_id"),
+        "origin_request_id": row.get("origin_request_id"),
+        "thread_role": row.get("thread_role"),
+        "parent_complexity": row.get("parent_complexity"),
+        "parent_tier": row.get("parent_tier"),
     }
 
 
@@ -850,12 +1159,36 @@ async def chat_completions(
 
     heuristic, signals = heuristic_tier(body)
 
+    # Threading: extract thread_id and claim parent state at admission time
+    # (before any I/O so siblings race-safely see each other).
+    thread_spec = CFG.threading
+    thread_header_name = (thread_spec.header_name or "").lower()
+    thread_header_value = request.headers.get(thread_header_name) if thread_header_name else None
+    thread_id = _extract_thread_id(body, thread_header_value)
+    parent_state: dict[str, Any] | None = None
+    is_subcall = False
+    if thread_id:
+        parent_state = await _claim_thread_state(thread_id, t0)
+        is_subcall = not parent_state["is_originating"]
+
+    # Classification text: when threading is enabled and classify_subcall_isolated
+    # is on for sub-calls, isolate the trailing message from the original ask
+    # so the classifier scores the actual sub-step.
+    classify_text: str | None = None
+    if thread_spec.enabled:
+        classify_text = _build_classification_text(body, is_subcall=is_subcall)
+
+    parent_tier_for_log: str | None = (parent_state or {}).get("previous_tier") if is_subcall else None
+    parent_complexity_for_log: int | None = (
+        (parent_state or {}).get("previous_complexity") if is_subcall else None
+    )
+
     if requested == "auto":
         used_local = False
         if CFG.classifier.mode == "local" and await ollama_healthy():
             try:
                 l_secret, l_complex, local_details = await asyncio.wait_for(
-                    local_classify(body),
+                    local_classify(body, classification_text=classify_text),
                     timeout=CFG.classifier.local_timeout_s + 0.5,
                 )
                 local_secret = 1 if l_secret else 0
@@ -884,7 +1217,9 @@ async def chat_completions(
                 tier, reason = heuristic, "heuristic"
                 classifier_source = classifier_source or "heuristic"
             elif CFG.classifier.mode in ("hybrid", "haiku", "local"):
-                tier, reason, tiebreaker = await haiku_tiebreaker(body)
+                tier, reason, tiebreaker = await haiku_tiebreaker(
+                    body, classification_text=classify_text,
+                )
                 classifier_source = classifier_source or "haiku_tiebreaker"
             else:
                 tier, reason = CFG.classifier.heuristic_default_tier, "heuristic-default"
@@ -895,6 +1230,18 @@ async def chat_completions(
     else:
         tier, reason = None, "passthrough"
         classifier_source = "passthrough"
+
+    # Threading policy: parent_tier_policy + per-thread sticky pairs.
+    # Both no-op when threading.enabled=false.
+    if thread_id and is_subcall and tier:
+        capped = _apply_parent_tier_policy(tier, parent_tier_for_log)
+        if capped != tier:
+            reason = (reason or "") + "+parent-cap"
+            tier = capped
+        sticky = _apply_thread_sticky(tier, parent_state, time.time())
+        if sticky != tier:
+            reason = (reason or "") + "+thread-sticky"
+            tier = sticky
 
     if classifier_source == "local_model":
         _record_tier(_extract_chat_id(body), tier, time.time())
@@ -909,8 +1256,8 @@ async def chat_completions(
     is_stream = bool(body.get("stream"))
 
     LOG.info(
-        "route tier=%s reason=%s requested=%s target=%s stream=%s fallback=%s",
-        tier, reason, requested, target_model, is_stream, fallback_applied,
+        "route tier=%s reason=%s requested=%s target=%s stream=%s fallback=%s thread=%s",
+        tier, reason, requested, target_model, is_stream, fallback_applied, thread_id,
     )
 
     response_headers = {
@@ -920,6 +1267,11 @@ async def chat_completions(
     }
     if fallback_applied:
         response_headers["x-llmrouter-fallback"] = "ollama-unreachable"
+    if thread_id:
+        response_headers["x-llmrouter-thread-id"] = thread_id
+        response_headers["x-llmrouter-thread-role"] = (
+            "subcall" if is_subcall else "originating"
+        )
 
     llm_secret_values = (local_details or {}).get("secret_values") or None
     log_text = _clean_user_text(_latest_user_text(body.get("messages", [])))
@@ -942,6 +1294,9 @@ async def chat_completions(
     )
     upstream = await client.send(upstream_req, stream=is_stream)
 
+    thread_role: str | None = None
+    if thread_id:
+        thread_role = "subcall" if is_subcall else "originating"
     base_row: dict[str, Any] = {
         "ts": t0,
         "duration_ms": None,
@@ -971,7 +1326,41 @@ async def chat_completions(
         "keywords": " ".join(keywords_list) if keywords_list else None,
         "messages_preview": messages_preview,
         "messages_full": messages_full,
+        "thread_id": thread_id,
+        "origin_request_id": (parent_state or {}).get("origin_request_id") if is_subcall else None,
+        "thread_role": thread_role,
+        "parent_complexity": parent_complexity_for_log,
+        "parent_tier": parent_tier_for_log,
     }
+
+    async def _finalize_thread_state(inserted_id: int | None) -> None:
+        """Backfill origin_request_id on originating rows (it == self.id) and
+        update the in-process state cache so siblings see this row."""
+        if not thread_id or inserted_id is None:
+            return
+        origin_id = base_row.get("origin_request_id") or inserted_id
+        if not is_subcall:
+            # Originating: backfill self-reference.
+            try:
+                conn = sqlite3.connect(ENV.db_path, check_same_thread=False, timeout=2.0)
+                try:
+                    conn.execute(
+                        "UPDATE requests SET origin_request_id = ? WHERE id = ?",
+                        (inserted_id, inserted_id),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as e:
+                LOG.debug("origin backfill failed: %s", e)
+        _record_thread_state(
+            thread_id,
+            origin_request_id=origin_id,
+            previous_request_id=inserted_id,
+            tier=tier,
+            complexity=local_complexity,
+            now=time.time(),
+        )
 
     if not is_stream:
         data = await upstream.aread()
@@ -979,6 +1368,10 @@ async def chat_completions(
         base_row["duration_ms"] = int((time.time() - t0) * 1000)
         inserted_id = await asyncio.to_thread(log_request, base_row)
         if inserted_id is not None:
+            if not is_subcall and thread_id:
+                base_row["origin_request_id"] = inserted_id
+            await asyncio.to_thread(lambda: None)  # yield
+            await _finalize_thread_state(inserted_id)
             await _hub_publish({
                 "type": "insert",
                 "id": inserted_id,
@@ -1004,6 +1397,9 @@ async def chat_completions(
             base_row["duration_ms"] = int((time.time() - t0) * 1000)
             inserted_id = await asyncio.to_thread(log_request, base_row)
             if inserted_id is not None:
+                if not is_subcall and thread_id:
+                    base_row["origin_request_id"] = inserted_id
+                await _finalize_thread_state(inserted_id)
                 await _hub_publish({
                     "type": "insert",
                     "id": inserted_id,

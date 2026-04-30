@@ -159,6 +159,85 @@ def test_top_level_must_be_mapping(tmp_path: Path):
         load_config(p)
 
 
+# --- threading -------------------------------------------------------------
+
+
+def test_threading_defaults_disabled():
+    cfg = load_config(None)
+    # Default loaded from llmrouter/config.default.yaml has enabled: false
+    # so legacy behavior is preserved.
+    assert cfg.threading.enabled is False
+    assert cfg.threading.parent_tier_policy == "inform"
+
+
+def test_threading_extractor_pattern_compiled(tmp_path: Path):
+    p = _write(tmp_path, """
+        threading:
+          enabled: true
+          extractors:
+            - { name: foo, source: last_user_text, pattern: '"x":\\s*"([^"]+)"' }
+    """)
+    cfg = load_config(p)
+    assert cfg.threading.enabled is True
+    ex = cfg.threading.extractors[0]
+    assert ex.compiled is not None
+    assert ex.compiled.search('"x": "abc"').group(1) == "abc"
+
+
+def test_threading_extractor_must_compile(tmp_path: Path):
+    p = _write(tmp_path, """
+        threading:
+          enabled: true
+          extractors:
+            - { name: bad, source: last_user_text, pattern: '(unclosed' }
+    """)
+    with pytest.raises(Exception):
+        load_config(p)
+
+
+def test_threading_extractor_must_have_one_capture_group(tmp_path: Path):
+    p = _write(tmp_path, """
+        threading:
+          enabled: true
+          extractors:
+            - { name: bad, source: last_user_text, pattern: 'no-group-here' }
+    """)
+    with pytest.raises(Exception):
+        load_config(p)
+
+
+def test_threading_extractor_rejects_multiple_capture_groups(tmp_path: Path):
+    p = _write(tmp_path, """
+        threading:
+          enabled: true
+          extractors:
+            - { name: bad, source: last_user_text, pattern: '(a)(b)' }
+    """)
+    with pytest.raises(Exception):
+        load_config(p)
+
+
+def test_threading_parent_tier_policy_enum(tmp_path: Path):
+    for policy in ("inform", "cap", "ignore"):
+        p = _write(tmp_path, f"""
+            threading:
+              enabled: true
+              parent_tier_policy: {policy}
+        """)
+        cfg = load_config(p)
+        assert cfg.threading.parent_tier_policy == policy
+
+
+def test_threading_parent_tier_policy_invalid_rejected(tmp_path: Path):
+    p = _write(tmp_path, """
+        threading:
+          enabled: true
+          parent_tier_policy: nuke
+    """)
+    with pytest.raises(Exception):
+        load_config(p)
+
+
 # --- runtime env -----------------------------------------------------------
 
 

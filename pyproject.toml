@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmrouter"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cost/sensitivity-aware OpenAI-compatible router with secret redaction, audit log, and self-hosted UI."
 readme = "README.md"
 requires-python = ">=3.11"
