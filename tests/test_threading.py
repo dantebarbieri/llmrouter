@@ -318,3 +318,80 @@ async def test_claim_after_ttl_is_originating_again(monkeypatch: pytest.MonkeyPa
     )
     later = await app._claim_thread_state(tid, now=1100.0)
     assert later["is_originating"] is True
+
+
+# --- _extract_subcall_summary ---------------------------------------------
+
+
+def test_subcall_summary_tool_result_with_assistant_preamble():
+    msgs = [
+        {"role": "user", "content": "Tell me about the japan trip"},
+        {
+            "role": "assistant",
+            "content": "Reading the travel file.",
+            "tool_calls": [
+                {"id": "call_1", "function": {"name": "read_file", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "# Japan trip H6\n..."},
+    ]
+    s = app._extract_subcall_summary(msgs, secret_keyword=None)
+    assert s is not None
+    assert s["kind"] == "tool_result"
+    assert s["tool_name"] == "read_file"
+    assert s["agent_says"] == "Reading the travel file."
+    assert "Japan trip" in s["summary"]
+
+
+def test_subcall_summary_tool_result_name_field_legacy():
+    msgs = [
+        {"role": "user", "content": "Q"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "x", "function": {"name": "price_check", "arguments": "{}"}}
+        ]},
+        {"role": "tool", "name": "price_check", "tool_call_id": "x", "content": "$123"},
+    ]
+    s = app._extract_subcall_summary(msgs, secret_keyword=None)
+    assert s is not None
+    assert s["tool_name"] == "price_check"
+    assert s["summary"] == "$123"
+
+
+def test_subcall_summary_assistant_text():
+    msgs = [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "I have enough to begin crafting a reply."},
+    ]
+    s = app._extract_subcall_summary(msgs, secret_keyword=None)
+    assert s is not None
+    assert s["kind"] == "assistant_text"
+    assert "crafting a reply" in s["summary"]
+
+
+def test_subcall_summary_user_continuation_truncates_long_text():
+    long = "x" * 1000
+    msgs = [{"role": "user", "content": long}]
+    s = app._extract_subcall_summary(msgs, secret_keyword=None)
+    assert s is not None
+    assert s["kind"] == "user_continuation"
+    assert s["summary"].endswith("…")
+    assert len(s["summary"]) <= 240
+
+
+def test_subcall_summary_returns_none_for_empty_messages():
+    assert app._extract_subcall_summary([], secret_keyword=None) is None
+
+
+def test_subcall_summary_scrubs_secret_values_when_classifier_keyword():
+    msgs = [{"role": "user", "content": "the password is hunter2"}]
+    s = app._extract_subcall_summary(
+        msgs, secret_keyword="llm_classifier", llm_secret_values=["hunter2"]
+    )
+    assert s is not None
+    assert "hunter2" not in s["summary"]
+    assert "[REDACTED" in s["summary"]
+
+
+def test_subcall_summary_returns_none_for_classifier_secret_no_values():
+    msgs = [{"role": "user", "content": "something"}]
+    assert app._extract_subcall_summary(msgs, secret_keyword="llm_classifier") is None

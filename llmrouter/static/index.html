@@ -208,7 +208,109 @@
   .row .snippet { color: var(--fg); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .row .meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
   .row.secret .snippet { color: var(--muted); font-style: italic; }
-  aside {
+
+  /* --- threading tree view --- */
+  .row.thread-head { background: linear-gradient(to bottom, var(--panel) 0%, transparent 100%); }
+  .row.thread-head.expanded { border-bottom-color: transparent; }
+  .row.subcall-step {
+    grid-template-columns: 64px 24px 1fr auto;
+    padding: 6px 20px 6px 44px;
+    border-bottom: 1px dashed var(--border);
+    background: var(--panel);
+    position: relative;
+    font-size: 13px;
+  }
+  .row.subcall-step:hover { background: var(--panel-2); }
+  .row.subcall-step::before {
+    content: "";
+    position: absolute;
+    left: 32px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--border);
+  }
+  .row.subcall-step.last-step::before { bottom: 50%; }
+  .row.subcall-step::after {
+    content: "";
+    position: absolute;
+    left: 32px;
+    top: 50%;
+    width: 10px;
+    height: 2px;
+    background: var(--border);
+  }
+  .row.subcall-step .step-icon {
+    font-size: 14px;
+    line-height: 1.4;
+    text-align: center;
+    color: var(--muted);
+  }
+  .row.subcall-step .step-body {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .row.subcall-step .step-headline {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .row.subcall-step .step-headline .tool-name {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--accent);
+    font-size: 12px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(99, 162, 255, 0.12);
+    margin-right: 6px;
+  }
+  .row.subcall-step .step-headline .step-kind-label {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 6px;
+  }
+  .row.subcall-step .step-preamble {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .row.subcall-step .step-meta {
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .thread-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px;
+    margin-left: 8px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 11px;
+    cursor: pointer;
+    user-select: none;
+    vertical-align: middle;
+  }
+  .thread-chip:hover { border-color: var(--accent); color: var(--fg); }
+  .thread-chip.expanded { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+  #thread-view-toggle.active, #originating-only-toggle.active {
+    background: var(--accent);
+    color: #0d1117;
+    border-color: var(--accent);
+  }
+  aside{
     padding: 16px 20px;
     overflow-y: auto;
     min-height: calc(100vh - 54px);
@@ -379,7 +481,7 @@ const state = {
   lastSuccess: 0,
   reasonsSeen: new Set(),   // populated from list results + stats
   threadView: false,        // true → group sub-calls under originating row
-  expandedThreads: new Set(),
+  expandedThreads: new Set(),  // semantics: presence == explicitly collapsed (default open in tree view)
   filters: {
     q: "",
     tiers: new Set(),
@@ -610,7 +712,36 @@ function renderStats() {
   ).join("");
 }
 
+// --- icon helpers ---
+const STEP_ICON_BY_KIND = {
+  tool_result: "🛠",
+  tool_call: "🔧",
+  user_continuation: "💬",
+  assistant_text: "🧠",
+  unknown: "•",
+};
+function iconForStep(s) {
+  if (!s) return "•";
+  const name = (s.tool_name || "").toLowerCase();
+  if (name) {
+    if (/(read|file|fs|cat|view)/.test(name))   return "📄";
+    if (/(write|edit|patch)/.test(name))        return "✏️";
+    if (/(search|grep|find|ripgrep)/.test(name)) return "🔍";
+    if (/(fetch|http|web|wiki|url)/.test(name)) return "🌐";
+    if (/(price|finance|stock|cost)/.test(name)) return "💲";
+    if (/(shell|exec|run|bash|terminal)/.test(name)) return "⌨️";
+    if (/(mcp|wikivoyage)/.test(name))          return "🔌";
+  }
+  return STEP_ICON_BY_KIND[s.kind] || "•";
+}
+function parseSubcallSummary(raw) {
+  if (!raw) return null;
+  if (typeof raw === "object") return raw;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
 function rowHtml(r, opts = {}) {
+  if (opts.asStep) return subcallStepHtml(r, opts);
   const secret = r.secret_keyword ? "secret" : "";
   const snippet = r.snippet
     ? r.snippet
@@ -626,17 +757,18 @@ function rowHtml(r, opts = {}) {
     r.tiebreaker_digit ? "haiku=" + r.tiebreaker_digit : null,
     r.parent_tier && r.thread_role === "subcall" ? "parent=" + r.parent_tier : null,
   ].filter(Boolean).join(" · ");
-  // Threading classes / chip:
+  const isHead = state.threadView && r.thread_role === "originating" && opts.subcallCount;
+  const expanded = isHead && !state.expandedThreads.has(r.thread_id);
   const threadClass = state.threadView && r.thread_role
     ? (r.thread_role === "subcall" ? "subcall" : "originating")
     : "";
+  const headClass = isHead ? "thread-head" + (expanded ? " expanded" : "") : "";
   let threadChip = "";
-  if (state.threadView && r.thread_role === "originating" && opts.subcallCount) {
-    const expanded = state.expandedThreads.has(r.thread_id);
-    threadChip = ` <span class="thread-chip${expanded ? " expanded" : ""}" data-thread="${escapeHtml(r.thread_id)}" title="${expanded ? "collapse" : "expand"} ${opts.subcallCount} sub-call${opts.subcallCount === 1 ? "" : "s"}">${expanded ? "▾" : "▸"} ${opts.subcallCount} sub-call${opts.subcallCount === 1 ? "" : "s"}</span>`;
+  if (isHead) {
+    threadChip = ` <span class="thread-chip${expanded ? " expanded" : ""}" data-thread="${escapeHtml(r.thread_id)}" title="${expanded ? "collapse" : "expand"} ${opts.subcallCount} sub-call${opts.subcallCount === 1 ? "" : "s"}">${expanded ? "▾" : "▸"} ${opts.subcallCount} step${opts.subcallCount === 1 ? "" : "s"}</span>`;
   }
   return `
-    <div class="row ${secret} ${threadClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+    <div class="row ${secret} ${threadClass} ${headClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
       <div class="time" title="${escapeHtml(fmtTime(r.ts))}">${relTime(r.ts)} ago</div>
       <div>${tierChip(r.tier)}<div class="meta">${escapeHtml(r.reason || "")}</div></div>
       <div>
@@ -644,6 +776,53 @@ function rowHtml(r, opts = {}) {
         <div class="meta">${escapeHtml(meta)}</div>
       </div>
       <div class="meta">#${r.id}</div>
+    </div>`;
+}
+
+function subcallStepHtml(r, opts = {}) {
+  const summary = parseSubcallSummary(r.subcall_summary);
+  const icon = iconForStep(summary);
+  const kindLabel = summary
+    ? (summary.tool_name
+        ? null
+        : (summary.kind === "user_continuation" ? "user"
+           : summary.kind === "assistant_text" ? "assistant"
+           : summary.kind === "tool_call" ? "tool call"
+           : summary.kind || "step"))
+    : null;
+  const headlineParts = [];
+  if (kindLabel) {
+    headlineParts.push(`<span class="step-kind-label">${escapeHtml(kindLabel)}</span>`);
+  }
+  if (summary && summary.tool_name) {
+    headlineParts.push(`<span class="tool-name">${escapeHtml(summary.tool_name)}</span>`);
+  }
+  const summaryText = summary && summary.summary
+    ? summary.summary
+    : (r.snippet || "");
+  if (summaryText) {
+    headlineParts.push(escapeHtml(summaryText));
+  } else if (!summary) {
+    headlineParts.push('<span class="meta">(no summary)</span>');
+  }
+  const preamble = summary && summary.agent_says
+    ? `<div class="step-preamble" title="${escapeHtml(summary.agent_says)}">${escapeHtml(summary.agent_says)}</div>`
+    : "";
+  const stepMeta = [
+    r.approx_tokens != null ? r.approx_tokens + " tok" : null,
+    r.duration_ms   != null ? r.duration_ms   + " ms"  : null,
+    "#" + r.id,
+  ].filter(Boolean).join(" · ");
+  const lastClass = opts.lastStep ? " last-step" : "";
+  return `
+    <div class="row subcall-step${lastClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+      <div>${tierChip(r.tier)}</div>
+      <div class="step-icon">${icon}</div>
+      <div class="step-body">
+        <div class="step-headline">${headlineParts.join(" ")}</div>
+        ${preamble}
+      </div>
+      <div class="step-meta">${escapeHtml(stepMeta)}</div>
     </div>`;
 }
 
@@ -712,8 +891,14 @@ function renderRows() {
     for (const node of tree) {
       if (node.kind === "orig") {
         parts.push(rowHtml(node.item, { subcallCount: node.group.subcalls.length }));
-        if (state.expandedThreads.has(node.item.thread_id)) {
-          for (const sub of node.group.subcalls) parts.push(rowHtml(sub));
+        if (!state.expandedThreads.has(node.item.thread_id)) {
+          // Render sub-calls in chronological order (oldest → newest) so the
+          // trajectory reads top-to-bottom, even though the parent list is
+          // newest-first.
+          const ordered = [...node.group.subcalls].sort((a, b) => a.ts - b.ts || a.id - b.id);
+          ordered.forEach((sub, i) => {
+            parts.push(rowHtml(sub, { asStep: true, lastStep: i === ordered.length - 1 }));
+          });
         }
       } else {
         parts.push(rowHtml(node.item));

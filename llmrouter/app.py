@@ -711,6 +711,130 @@ async def local_classify(
         raise
 
 
+def _content_to_text(content: Any) -> str:
+    """Flatten OpenAI-style message content (str or list-of-parts) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                if isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+                elif isinstance(p.get("content"), str):
+                    parts.append(p["content"])
+            elif isinstance(p, str):
+                parts.append(p)
+        return "\n".join(parts)
+    return str(content)
+
+
+_SUMMARY_MAX_CHARS = 240
+
+
+def _shorten(text: str, limit: int = _SUMMARY_MAX_CHARS) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _extract_subcall_summary(
+    messages: list[dict[str, Any]],
+    secret_keyword: str | None,
+    llm_secret_values: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Build a compact 'what triggered this LLM call' summary from the
+    most recent message in the conversation history.
+
+    Returns a dict with keys: kind, tool_name, agent_says, summary.
+    None when there's nothing meaningful to display (empty messages, or
+    secret_keyword=='llm_classifier' without scrub values — same gating
+    as _serialize_full_messages).
+    """
+    if not messages:
+        return None
+    if secret_keyword == "llm_classifier" and not llm_secret_values:
+        return None
+
+    regex_scrub = secret_keyword is not None and secret_keyword != "llm_classifier"
+    has_values = bool(llm_secret_values)
+
+    def scrub(s: str) -> str:
+        if not s:
+            return s
+        if regex_scrub:
+            s = _scrub_secrets(s)
+        if has_values:
+            s = _scrub_with_values(s, llm_secret_values or [])
+        return s
+
+    last = messages[-1]
+    role = last.get("role")
+    out: dict[str, Any] = {
+        "kind": role or "unknown",
+        "tool_name": None,
+        "agent_says": None,
+        "summary": "",
+    }
+
+    if role == "tool":
+        tool_call_id = last.get("tool_call_id")
+        tool_name = last.get("name")
+        agent_says = None
+        if not tool_name or tool_call_id:
+            for m in reversed(messages[:-1]):
+                if m.get("role") != "assistant":
+                    continue
+                tcs = m.get("tool_calls") or []
+                matched = None
+                if tool_call_id:
+                    for tc in tcs:
+                        if tc.get("id") == tool_call_id:
+                            matched = tc
+                            break
+                if matched is None and tcs and not tool_call_id:
+                    matched = tcs[0]
+                if matched and not tool_name:
+                    fn = matched.get("function") or {}
+                    tool_name = fn.get("name")
+                if matched is not None:
+                    agent_says = _content_to_text(m.get("content")) or None
+                    break
+        out["kind"] = "tool_result"
+        out["tool_name"] = tool_name or None
+        if agent_says:
+            out["agent_says"] = _shorten(scrub(agent_says), 160)
+        out["summary"] = _shorten(scrub(_content_to_text(last.get("content"))))
+    elif role == "user":
+        out["kind"] = "user_continuation"
+        out["summary"] = _shorten(scrub(_content_to_text(last.get("content"))))
+    elif role == "assistant":
+        text = _content_to_text(last.get("content"))
+        tcs = last.get("tool_calls") or []
+        if tcs and not text:
+            fn = (tcs[0].get("function") or {})
+            out["kind"] = "tool_call"
+            out["tool_name"] = fn.get("name")
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                out["summary"] = _shorten(scrub(args), 160)
+        else:
+            out["kind"] = "assistant_text"
+            out["summary"] = _shorten(scrub(text))
+    else:
+        out["summary"] = _shorten(scrub(_content_to_text(last.get("content"))))
+
+    if not out["summary"] and not out["tool_name"] and not out["agent_says"]:
+        return None
+    return out
+
+
 def _serialize_full_messages(
     messages: list[dict[str, Any]],
     secret_keyword: str | None,
@@ -804,6 +928,11 @@ _REQUESTS_ADDED_COLUMNS: list[tuple[str, str]] = [
     ("parent_complexity", "INTEGER"),
     # Snapshot of the parent's tier at routing time.
     ("parent_tier", "TEXT"),
+    # Per-row 'what triggered this LLM call' summary (JSON object with
+    # keys: kind, tool_name, agent_says, summary). Populated for sub-calls
+    # so the UI can render a trajectory tree without repeating the user
+    # prompt. NULL for originating rows and pre-threading rows.
+    ("subcall_summary", "TEXT"),
 ]
 
 
@@ -1023,6 +1152,7 @@ def search_requests(
                        requests.thread_id, requests.origin_request_id,
                        requests.thread_role, requests.parent_complexity,
                        requests.parent_tier,
+                       requests.subcall_summary,
                        substr(coalesce(requests.messages_preview, ''), 1, 240) AS snippet
                 FROM requests {joins}{where_sql}
                 ORDER BY requests.ts DESC
@@ -1116,6 +1246,7 @@ def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
         "thread_role": row.get("thread_role"),
         "parent_complexity": row.get("parent_complexity"),
         "parent_tier": row.get("parent_tier"),
+        "subcall_summary": row.get("subcall_summary"),
     }
 
 
@@ -1319,6 +1450,13 @@ async def chat_completions(
     thread_role: str | None = None
     if thread_id:
         thread_role = "subcall" if is_subcall else "originating"
+    subcall_summary_obj: dict[str, Any] | None = None
+    if thread_id and is_subcall:
+        subcall_summary_obj = _extract_subcall_summary(
+            body.get("messages", []),
+            signals.get("secret_keyword"),
+            llm_secret_values,
+        )
     base_row: dict[str, Any] = {
         "ts": t0,
         "duration_ms": None,
@@ -1353,6 +1491,8 @@ async def chat_completions(
         "thread_role": thread_role,
         "parent_complexity": parent_complexity_for_log,
         "parent_tier": parent_tier_for_log,
+        "subcall_summary": json.dumps(subcall_summary_obj, ensure_ascii=False)
+        if subcall_summary_obj else None,
     }
 
     async def _finalize_thread_state(inserted_id: int | None) -> None:
