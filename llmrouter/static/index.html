@@ -1,0 +1,1136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>llmrouter — request log</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1f2630;
+    --border: #2a313c;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --local: #8b949e;
+    --local-thinking: #58a6ff;
+    --haiku: #3fb950;
+    --sonnet: #a371f7;
+    --opus: #f0883e;
+    --none: #6e7681;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    font-size: 14px;
+  }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+  header h1 .muted { color: var(--muted); font-weight: 400; }
+  .search {
+    flex: 1 1 320px;
+    min-width: 260px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  input, select, button {
+    background: var(--panel-2);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  input[type=search] { flex: 1; }
+  input:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  button { cursor: pointer; }
+  button:hover { background: #263040; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 500;
+    color: #0d1117;
+    white-space: nowrap;
+  }
+  .chip.tier-local          { background: var(--local); }
+  .chip.tier-local-thinking { background: var(--local-thinking); }
+  .chip.tier-haiku          { background: var(--haiku); }
+  .chip.tier-sonnet         { background: var(--sonnet); color: #fff; }
+  .chip.tier-opus           { background: var(--opus); }
+  .chip.tier-none           { background: var(--none); color: #fff; }
+  .chip.muted {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+
+  /* connection status pill */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    white-space: nowrap;
+  }
+  .pill.conn-live         { color: var(--ok);   border-color: var(--ok); }
+  .pill.conn-connecting   { color: var(--muted); }
+  .pill.conn-reconnecting { color: var(--warn); border-color: var(--warn); }
+  .pill.conn-offline      { color: var(--err);  border-color: var(--err); }
+
+  /* filter row */
+  .filter-row {
+    padding: 8px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    position: sticky;
+    top: 54px;
+    z-index: 9;
+  }
+  .filter-row details.multi { position: relative; }
+  .filter-row details.multi > summary {
+    list-style: none;
+    cursor: pointer;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    user-select: none;
+  }
+  .filter-row details.multi > summary::-webkit-details-marker { display: none; }
+  .filter-row details.multi[open] > summary { border-color: var(--accent); }
+  .multi-body {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    min-width: 180px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    z-index: 20;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .multi-body label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .toggle {
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .toggle:hover { background: var(--panel-2); }
+  .toggle.on {
+    background: var(--accent);
+    color: #0d1117;
+    border-color: var(--accent);
+  }
+  .toggle[data-toggle="hasSecret"].on { background: var(--err); border-color: var(--err); color: #fff; }
+  .toggle[data-toggle="fallback"].on  { background: var(--warn); border-color: var(--warn); color: #0d1117; }
+  .toggle[data-toggle="slow"].on      { background: var(--opus); border-color: var(--opus); color: #0d1117; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 0; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .list { border-right: 1px solid var(--border); min-height: calc(100vh - 54px); }
+  .summary {
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .summary .tier-stats { display: flex; gap: 6px; flex-wrap: wrap; }
+  #cache-note {
+    font-size: 11px;
+    color: var(--warn);
+    font-style: italic;
+  }
+  .row {
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: grid;
+    grid-template-columns: 64px 100px 1fr auto;
+    gap: 12px;
+    align-items: start;
+  }
+  .row:hover { background: var(--panel); }
+  .row.selected { background: var(--panel-2); }
+  .row .time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .row .snippet { color: var(--fg); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .row .meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .row.secret .snippet { color: var(--muted); font-style: italic; }
+  aside {
+    padding: 16px 20px;
+    overflow-y: auto;
+    min-height: calc(100vh - 54px);
+    position: sticky;
+    top: 54px;
+    max-height: calc(100vh - 54px);
+  }
+  aside h2 { font-size: 14px; margin: 0 0 10px 0; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px; margin: 8px 0; }
+  .kv .k { color: var(--muted); font-size: 12px; }
+  .kv .v { font-size: 13px; word-break: break-word; }
+  .section {
+    margin: 14px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+  }
+  .section h3 {
+    margin: 0 0 8px 0;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  pre {
+    margin: 0;
+    padding: 10px;
+    background: #0a0d12;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px;
+    max-height: 320px;
+    overflow: auto;
+  }
+  .empty { padding: 60px 20px; color: var(--muted); text-align: center; }
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 20;
+  }
+  .overlay .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    width: 360px;
+    max-width: 90vw;
+  }
+  .overlay h2 { margin: 0 0 10px 0; font-size: 16px; }
+  .overlay p  { margin: 0 0 14px 0; color: var(--muted); font-size: 13px; }
+  .row-flex { display: flex; gap: 8px; }
+  .hide { display: none !important; }
+  .err { color: var(--err); }
+  .detail-footer {
+    margin-top: 20px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: flex-end;
+  }
+  .delete-btn {
+    background: var(--panel-2);
+    border: 1px solid var(--err);
+    color: var(--err);
+  }
+  .delete-btn:hover { background: var(--err); color: #fff; }
+  .delete-btn.secret { background: var(--err); color: #fff; font-weight: 600; }
+  .delete-btn.secret:hover { background: #c93a32; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>llmrouter <span class="muted">— request log</span></h1>
+  <div class="search">
+    <input id="q" type="search" placeholder="search keywords / messages (e.g. python sonnet refactor)" autocomplete="off" />
+    <button id="refresh" title="refresh" aria-label="refresh">↻</button>
+    <button id="logout" title="clear stored API key" aria-label="clear stored API key">⎋</button>
+    <span id="conn-pill" class="pill conn-connecting" title="">● connecting…</span>
+  </div>
+</header>
+
+<div class="filter-row">
+  <details class="multi" id="tier-multi">
+    <summary>tier: any</summary>
+    <div class="multi-body" id="tier-body"></div>
+  </details>
+  <details class="multi" id="reason-multi">
+    <summary>reason: any</summary>
+    <div class="multi-body" id="reason-body">
+      <div class="muted" style="font-size:12px;">load data to populate</div>
+    </div>
+  </details>
+  <button class="toggle" data-toggle="fallback">fallback</button>
+  <button class="toggle" data-toggle="hasSecret">has secret</button>
+  <button class="toggle" data-toggle="isStream">streamed</button>
+  <button class="toggle" data-toggle="slow">slow (&gt;5s)</button>
+  <select id="since">
+    <option value="">all time</option>
+    <option value="3600">1h</option>
+    <option value="86400">24h</option>
+    <option value="604800">7d</option>
+    <option value="2592000">30d</option>
+    <option value="custom">custom…</option>
+  </select>
+  <input type="datetime-local" id="custom-since" class="hide" title="from" />
+  <input type="datetime-local" id="custom-until" class="hide" title="to" />
+  <button id="filter-clear" title="clear all filters">clear</button>
+</div>
+
+<main>
+  <section class="list">
+    <div class="summary">
+      <div id="result-summary">—</div>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <div id="cache-note" class="hide">showing cached data</div>
+        <div id="tier-stats" class="tier-stats"></div>
+      </div>
+    </div>
+    <div id="rows"></div>
+  </section>
+  <aside id="detail">
+    <div class="empty">Select a request to see classification details.</div>
+  </aside>
+</main>
+
+<div id="login" class="overlay hide">
+  <div class="card">
+    <h2>Unlock</h2>
+    <p>Enter your router API key to view the request log. It is stored in your browser only.</p>
+    <div class="row-flex">
+      <input id="login-key" type="password" placeholder="ROUTER_API_KEY" style="flex:1;" />
+      <button id="login-go">Unlock</button>
+    </div>
+    <p id="login-err" class="err hide" style="margin-top:10px;">Invalid key.</p>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// --- constants ---
+const KEY_STORAGE    = "llmrouter.apikey";
+const CACHE_KEY      = "llmrouter.cache.v1";
+const CACHE_MAX_ROWS = 200;
+const CACHE_TTL_MS   = 24 * 3600 * 1000;
+const SLOW_REQ_MS    = 5000;
+const TIERS          = ["local", "local-thinking", "haiku", "sonnet", "opus"];
+
+// --- state ---
+let apiKey = localStorage.getItem(KEY_STORAGE) || "";
+const state = {
+  rows: [],                 // list items, newest first, deduped by id
+  selectedId: null,
+  maxId: 0,                 // high-water mark for WS backfill
+  connStatus: "connecting", // connecting | live | reconnecting | offline
+  lastSuccess: 0,
+  reasonsSeen: new Set(),   // populated from list results + stats
+  filters: {
+    q: "",
+    tiers: new Set(),
+    reasons: new Set(),
+    fallback: null,   // null | 1
+    hasSecret: null,
+    isStream: null,
+    slow: false,
+    since: "",        // "" | seconds | "custom"
+    customSince: "",  // datetime-local value
+    customUntil: "",
+  },
+};
+
+// --- utils ---
+function fmtTime(ts) { return new Date(ts * 1000).toLocaleString(); }
+function relTime(ts) {
+  const secs = Math.max(0, Date.now() / 1000 - ts);
+  if (secs < 60)    return Math.floor(secs) + "s";
+  if (secs < 3600)  return Math.floor(secs / 60) + "m";
+  if (secs < 86400) return Math.floor(secs / 3600) + "h";
+  return Math.floor(secs / 86400) + "d";
+}
+function tierChip(t) {
+  const cls = "tier-" + (t || "none");
+  return `<span class="chip ${cls}">${t || "—"}</span>`;
+}
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s)
+    .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;").replaceAll("'","&#39;");
+}
+function throttle(fn, ms) {
+  let pending = null, last = 0;
+  return (...args) => {
+    const now = Date.now(), wait = ms - (now - last);
+    if (wait <= 0) { last = now; fn(...args); }
+    else { clearTimeout(pending); pending = setTimeout(() => { last = Date.now(); fn(...args); }, wait); }
+  };
+}
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+// --- auth / api ---
+async function api(path, opts = {}) {
+  const headers = { Authorization: "Bearer " + apiKey, ...(opts.headers || {}) };
+  const r = await fetch(path, { ...opts, headers });
+  if (r.status === 401) { showLogin(true); throw new Error("unauthorized"); }
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+function showLogin(isError) {
+  document.getElementById("login").classList.remove("hide");
+  document.getElementById("login-err").classList.toggle("hide", !isError);
+  document.getElementById("login-key").focus();
+}
+function hideLogin() { document.getElementById("login").classList.add("hide"); }
+
+async function tryUnlock() {
+  const v = document.getElementById("login-key").value.trim();
+  if (!v) return;
+  apiKey = v;
+  try {
+    await api("/ui/api/stats");
+    localStorage.setItem(KEY_STORAGE, apiKey);
+    hideLogin();
+    wsClient.reset();
+    await refreshAll();
+    wsClient.connect();
+  } catch (_) {
+    document.getElementById("login-err").classList.remove("hide");
+  }
+}
+
+function logout() {
+  localStorage.removeItem(KEY_STORAGE);
+  apiKey = "";
+  wsClient.close();
+  showLogin(false);
+}
+
+// --- cache ---
+const saveCache = throttle(() => {
+  try {
+    const tail = state.rows.slice(0, CACHE_MAX_ROWS);
+    localStorage.setItem(CACHE_KEY, JSON.stringify({
+      rows: tail, maxId: state.maxId, cached_at: Date.now(),
+    }));
+  } catch (_) { /* quota */ }
+}, 1000);
+
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.cached_at || Date.now() - obj.cached_at > CACHE_TTL_MS) return;
+    if (!Array.isArray(obj.rows)) return;
+    state.rows = obj.rows;
+    state.maxId = Math.max(0, obj.maxId | 0);
+    for (const r of state.rows) if (r.reason) state.reasonsSeen.add(r.reason);
+  } catch (_) { /* ignore */ }
+}
+
+// --- filters: url hash + server params + client match ---
+function saveHash() {
+  const f = state.filters;
+  const h = new URLSearchParams();
+  if (f.q) h.set("q", f.q);
+  for (const t of f.tiers) h.append("tier", t);
+  for (const r of f.reasons) h.append("reason", r);
+  if (f.fallback !== null)  h.set("fallback", String(f.fallback));
+  if (f.hasSecret !== null) h.set("has_secret", String(f.hasSecret));
+  if (f.isStream !== null)  h.set("is_stream", String(f.isStream));
+  if (f.slow)               h.set("slow", "1");
+  if (f.since)              h.set("since", f.since);
+  if (f.customSince)        h.set("custom_since", f.customSince);
+  if (f.customUntil)        h.set("custom_until", f.customUntil);
+  const str = h.toString();
+  const target = str ? "#" + str : "#";
+  if (location.hash !== target) history.replaceState(null, "", target);
+}
+
+function loadHash() {
+  const h = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const f = state.filters;
+  f.q         = h.get("q") || "";
+  f.tiers     = new Set(h.getAll("tier"));
+  f.reasons   = new Set(h.getAll("reason"));
+  f.fallback  = h.has("fallback")   ? parseInt(h.get("fallback"))   : null;
+  f.hasSecret = h.has("has_secret") ? parseInt(h.get("has_secret")) : null;
+  f.isStream  = h.has("is_stream")  ? parseInt(h.get("is_stream"))  : null;
+  f.slow      = h.get("slow") === "1";
+  f.since     = h.get("since") || "";
+  f.customSince = h.get("custom_since") || "";
+  f.customUntil = h.get("custom_until") || "";
+}
+
+function filtersToServerParams(extra = {}) {
+  const f = state.filters;
+  const p = new URLSearchParams();
+  if (f.q) p.set("q", f.q);
+  for (const t of f.tiers)   p.append("tier", t);
+  for (const r of f.reasons) p.append("reason", r);
+  if (f.fallback !== null)   p.set("fallback", String(f.fallback));
+  if (f.hasSecret !== null)  p.set("has_secret", String(f.hasSecret));
+  if (f.isStream !== null)   p.set("is_stream", String(f.isStream));
+  if (f.slow)                p.set("min_duration_ms", String(SLOW_REQ_MS));
+  if (f.since === "custom") {
+    if (f.customSince) {
+      const t = new Date(f.customSince).getTime();
+      if (!isNaN(t)) p.set("since", (t / 1000).toFixed(0));
+    }
+    if (f.customUntil) {
+      const t = new Date(f.customUntil).getTime();
+      if (!isNaN(t)) p.set("until", (t / 1000).toFixed(0));
+    }
+  } else if (f.since) {
+    p.set("since", (Date.now() / 1000 - parseInt(f.since)).toFixed(0));
+  }
+  for (const [k, v] of Object.entries(extra)) p.set(k, v);
+  return p;
+}
+
+function matchesFilters(item) {
+  // Client-side check for live-WS inserts — must avoid rendering rows that
+  // don't satisfy the current filter set. Text search is not re-evaluated
+  // client-side; a row that *would* match via FTS will show up on the next
+  // server refresh, but we don't re-run the tokenizer here.
+  const f = state.filters;
+  if (f.tiers.size   && !f.tiers.has(item.tier || ""))     return false;
+  if (f.reasons.size && !f.reasons.has(item.reason || "")) return false;
+  if (f.fallback === 1  && !item.fallback_applied)  return false;
+  if (f.fallback === 0  &&  item.fallback_applied)  return false;
+  if (f.hasSecret === 1 && !item.secret_keyword)    return false;
+  if (f.hasSecret === 0 &&  item.secret_keyword)    return false;
+  if (f.isStream === 1  && !item.is_stream)         return false;
+  if (f.isStream === 0  &&  item.is_stream)         return false;
+  if (f.slow && (item.duration_ms || 0) < SLOW_REQ_MS) return false;
+  // Time filter: only apply the lower bound client-side; the server applies
+  // the exact bound on the next full refresh.
+  if (f.since && f.since !== "custom") {
+    const cutoff = Date.now() / 1000 - parseInt(f.since);
+    if ((item.ts || 0) < cutoff) return false;
+  }
+  return true;
+}
+
+// --- rendering ---
+function renderStatusPill() {
+  const pill = document.getElementById("conn-pill");
+  const labels = {
+    connecting:   "● connecting…",
+    live:         "● live",
+    reconnecting: "● reconnecting…",
+    offline:      "● offline",
+  };
+  pill.textContent = labels[state.connStatus] || state.connStatus;
+  pill.className = "pill conn-" + state.connStatus;
+  pill.title = state.lastSuccess
+    ? "last successful refresh: " + new Date(state.lastSuccess).toLocaleString()
+    : "no successful refresh yet";
+  const stale = state.connStatus !== "live"
+              && state.lastSuccess
+              && (Date.now() - state.lastSuccess > 30000);
+  document.getElementById("cache-note").classList.toggle("hide", !stale);
+}
+
+function renderStats() {
+  const el = document.getElementById("tier-stats");
+  const counts = {};
+  for (const r of state.rows) {
+    const t = r.tier || "—";
+    counts[t] = (counts[t] || 0) + 1;
+  }
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  el.innerHTML = entries.map(
+    ([t, n]) => `<span class="chip tier-${t === "—" ? "none" : t}">${escapeHtml(t)}: ${n}</span>`
+  ).join("");
+}
+
+function rowHtml(r) {
+  const secret = r.secret_keyword ? "secret" : "";
+  const snippet = r.snippet
+    ? r.snippet
+    : r.secret_keyword
+      ? "[message preview withheld — secret location unknown]"
+      : "(empty prompt)";
+  const meta = [
+    r.approx_tokens   != null ? r.approx_tokens + " tok" : null,
+    r.duration_ms     != null ? r.duration_ms   + " ms"  : null,
+    r.is_stream       ? "stream"   : null,
+    r.fallback_applied ? "fallback" : null,
+    r.local_complexity != null ? "local=" + r.local_complexity : null,
+    r.tiebreaker_digit ? "haiku=" + r.tiebreaker_digit : null,
+  ].filter(Boolean).join(" · ");
+  return `
+    <div class="row ${secret} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+      <div class="time" title="${escapeHtml(fmtTime(r.ts))}">${relTime(r.ts)} ago</div>
+      <div>${tierChip(r.tier)}<div class="meta">${escapeHtml(r.reason || "")}</div></div>
+      <div>
+        <div class="snippet">${escapeHtml(snippet)}</div>
+        <div class="meta">${escapeHtml(meta)}</div>
+      </div>
+      <div class="meta">#${r.id}</div>
+    </div>`;
+}
+
+function renderRows() {
+  const visible = state.rows.filter(matchesFilters);
+  const summary = document.getElementById("result-summary");
+  const rowsEl = document.getElementById("rows");
+  if (!visible.length) {
+    summary.textContent = state.rows.length ? "no matches" : "no requests";
+    rowsEl.innerHTML = `<div class="empty">Nothing to show.</div>`;
+    renderStats();
+    return;
+  }
+  summary.textContent = visible.length + " request" + (visible.length === 1 ? "" : "s")
+    + (visible.length !== state.rows.length ? ` (of ${state.rows.length} loaded)` : "");
+  rowsEl.innerHTML = visible.map(rowHtml).join("");
+  for (const el of rowsEl.querySelectorAll(".row")) {
+    el.onclick = () => selectRow(parseInt(el.dataset.id));
+  }
+  renderStats();
+}
+
+// --- list state mutation ---
+function upsertRow(item) {
+  const idx = state.rows.findIndex(r => r.id === item.id);
+  if (idx >= 0) {
+    state.rows[idx] = { ...state.rows[idx], ...item };
+  } else {
+    // newest-first insertion by ts, then id
+    let pos = 0;
+    while (pos < state.rows.length
+           && (state.rows[pos].ts > item.ts
+               || (state.rows[pos].ts === item.ts && state.rows[pos].id > item.id))) {
+      pos++;
+    }
+    state.rows.splice(pos, 0, item);
+  }
+  if (item.id > state.maxId) state.maxId = item.id;
+  if (item.reason) state.reasonsSeen.add(item.reason);
+}
+
+function removeRow(id) {
+  const idx = state.rows.findIndex(r => r.id === id);
+  if (idx >= 0) state.rows.splice(idx, 1);
+  if (state.selectedId === id) {
+    state.selectedId = null;
+    document.getElementById("detail").innerHTML =
+      `<div class="empty">Select a request to see classification details.</div>`;
+  }
+}
+
+// --- detail pane ---
+function flag(label, value, hintWhenTrue) {
+  const on = !!value;
+  return `<span class="chip ${on ? "tier-haiku" : "muted"}" title="${escapeHtml(hintWhenTrue || "")}">${label}: ${on ? (value === true || value === 1 ? "yes" : value) : "no"}</span>`;
+}
+
+async function selectRow(id) {
+  state.selectedId = id;
+  document.querySelectorAll(".row").forEach(el => {
+    el.classList.toggle("selected", parseInt(el.dataset.id) === id);
+  });
+  try {
+    const r = await api("/ui/api/requests/" + id);
+    renderDetail(r);
+  } catch (e) {
+    document.getElementById("detail").innerHTML =
+      `<div class="empty err">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderDetail(r) {
+  const kv = (k, v) => `<div class="k">${k}</div><div class="v">${v}</div>`;
+  const preview = r.messages_preview
+    ? escapeHtml(r.messages_preview)
+    : r.secret_keyword
+      ? `<em>withheld (secret detected: ${escapeHtml(r.secret_keyword)}, location unknown)</em>`
+      : "(empty prompt)";
+
+  let fullMessagesBody = "";
+  if (r.messages_full) {
+    let pretty = r.messages_full;
+    try { pretty = JSON.stringify(JSON.parse(r.messages_full), null, 2); } catch (_) { /* truncated/raw */ }
+    fullMessagesBody = `<pre>${escapeHtml(pretty)}</pre>`;
+  } else if (r.secret_keyword === "llm_classifier") {
+    fullMessagesBody = "<em>withheld (LLM flagged a secret but the location is unknown — the full body wasn't stored)</em>";
+  } else {
+    fullMessagesBody = "<em>not stored</em>";
+  }
+  const fullMessagesSection = `
+    <div class="section">
+      <details>
+        <summary style="cursor:pointer;color:var(--muted);font-size:13px;">Full body (system prompt + all turns + tool results)</summary>
+        ${fullMessagesBody}
+      </details>
+    </div>`;
+
+  const localClassifierSection = (r.local_classifier_prompt || r.local_classifier_error) ? `
+    <div class="section">
+      <h3>Local classifier (${escapeHtml(r.classifier_model || "—")})</h3>
+      <div class="kv">
+        ${kv("source", `<code>${escapeHtml(r.classifier_source || "—")}</code>`)}
+        ${kv("complexity", `<b>${r.local_complexity ?? "—"}</b>`)}
+        ${kv("model-secret", r.local_secret ? '<span class="err">yes</span>' : "no")}
+        ${r.local_classifier_error ? kv("error", `<span class="err">${escapeHtml(r.local_classifier_error)}</span>`) : ""}
+      </div>
+      ${r.local_classifier_response ? `<details><summary style="cursor:pointer;color:var(--muted);font-size:12px;">show raw JSON response</summary><pre>${escapeHtml(r.local_classifier_response)}</pre></details>` : ""}
+      ${r.local_classifier_prompt   ? `<details><summary style="cursor:pointer;color:var(--muted);font-size:12px;">show prompt sent to local model</summary><pre>${escapeHtml(r.local_classifier_prompt)}</pre></details>` : ""}
+    </div>
+  ` : "";
+
+  const tiebreakerSection = r.tiebreaker_prompt ? `
+    <div class="section">
+      <h3>Haiku tiebreaker (fallback)</h3>
+      <div class="kv">
+        ${kv("digit", `<b>${escapeHtml(r.tiebreaker_digit || "—")}</b>`)}
+        ${kv("raw response", `<code>${escapeHtml(r.tiebreaker_response || "—")}</code>`)}
+        ${r.tiebreaker_error ? kv("error", `<span class="err">${escapeHtml(r.tiebreaker_error)}</span>`) : ""}
+      </div>
+      <details><summary style="cursor:pointer;color:var(--muted);font-size:12px;">show prompt sent to Haiku</summary>
+        <pre>${escapeHtml(r.tiebreaker_prompt)}</pre>
+      </details>
+    </div>
+  ` : "";
+
+  const kwList = (r.keywords || "").split(/\s+/).filter(Boolean);
+  const kwChips = kwList.length
+    ? kwList.map(k => `<span class="chip muted" style="cursor:pointer" data-kw="${escapeHtml(k)}">${escapeHtml(k)}</span>`).join(" ")
+    : `<span class="muted">none</span>`;
+
+  const deleteLabel = r.secret_keyword ? "Delete (contains secret)" : "Delete";
+  const deleteClass = r.secret_keyword ? "delete-btn secret" : "delete-btn";
+
+  document.getElementById("detail").innerHTML = `
+    <h2>Request #${r.id} ${tierChip(r.tier)}</h2>
+    <div class="kv">
+      ${kv("timestamp", escapeHtml(fmtTime(r.ts)))}
+      ${kv("requested", `<code>${escapeHtml(r.requested_model || "—")}</code>`)}
+      ${kv("target", `<code>${escapeHtml(r.target_model || "—")}</code>`)}
+      ${kv("reason", `<code>${escapeHtml(r.reason || "—")}</code>`)}
+      ${kv("duration", (r.duration_ms == null ? "—" : r.duration_ms + " ms"))}
+      ${kv("upstream", r.upstream_status || "—")}
+      ${kv("stream", r.is_stream ? "yes" : "no")}
+      ${kv("fallback", r.fallback_applied ? '<span class="err">yes (ollama unreachable)</span>' : "no")}
+    </div>
+
+    <div class="section">
+      <h3>Classification signals</h3>
+      <div class="chips">
+        <span class="chip muted">tokens: ${r.approx_tokens ?? "?"}</span>
+        ${flag("tools", r.has_tools)}
+        ${flag("code fence", r.has_code)}
+        <span class="chip ${r.step_keyword ? "tier-local-thinking" : "muted"}" title="step-planning keyword matched">step: ${escapeHtml(r.step_keyword || "no")}</span>
+        <span class="chip ${r.secret_keyword ? "tier-opus" : "muted"}" title="secret-like keyword matched">secret: ${escapeHtml(r.secret_keyword || "no")}</span>
+      </div>
+    </div>
+
+    ${localClassifierSection}
+    ${tiebreakerSection}
+
+    <div class="section">
+      <h3>Keywords</h3>
+      <div class="chips">${kwChips}</div>
+    </div>
+
+    <div class="section">
+      <h3>Latest user message</h3>
+      <pre>${preview}</pre>
+    </div>
+
+    ${fullMessagesSection}
+
+    <div class="detail-footer">
+      <button id="detail-delete" class="${deleteClass}">${deleteLabel}</button>
+    </div>
+  `;
+
+  document.querySelectorAll("#detail .chip[data-kw]").forEach(el => {
+    el.onclick = () => {
+      document.getElementById("q").value = el.dataset.kw;
+      state.filters.q = el.dataset.kw;
+      saveHash();
+      refreshAll();
+    };
+  });
+  document.getElementById("detail-delete").onclick = () => deleteSelected(r);
+}
+
+async function deleteSelected(r) {
+  const id = r.id;
+  const note = r.secret_keyword
+    ? `\n\nThis row was flagged as containing a secret (${r.secret_keyword}).`
+    : "";
+  if (!confirm(`Permanently delete request #${id}?${note}`)) return;
+  try {
+    await api("/ui/api/requests/" + id, { method: "DELETE" });
+    // Authoritative update comes via the WS `delete` event. If the socket
+    // is down, fall back to a local remove so the UI feels responsive.
+    if (!wsClient.isOpen()) { removeRow(id); renderRows(); saveCache(); }
+  } catch (e) {
+    alert("Delete failed: " + e.message);
+  }
+}
+
+// --- network ---
+async function refreshList() {
+  try {
+    const params = filtersToServerParams({ limit: "200" });
+    const res = await api("/ui/api/requests?" + params.toString());
+    state.rows = res.items.slice();
+    for (const item of state.rows) {
+      if (item.id > state.maxId) state.maxId = item.id;
+      if (item.reason) state.reasonsSeen.add(item.reason);
+    }
+    state.lastSuccess = Date.now();
+    saveCache();
+    renderRows();
+    renderStatusPill();
+    renderReasonOptions();
+  } catch (e) {
+    // Keep prior state; do not clear rows. Pill will reflect offline status
+    // on next WS tick; mark lastSuccess unchanged so the cache-note shows.
+    console.warn("refreshList failed:", e);
+  }
+}
+
+async function refreshStats() {
+  try {
+    const s = await api("/ui/api/stats");
+    for (const b of (s.by_reason || [])) if (b.reason) state.reasonsSeen.add(b.reason);
+    renderReasonOptions();
+  } catch (_) { /* ignore */ }
+}
+
+async function backfill() {
+  // After a WS (re)connect, pull any rows with id > our high-water mark so
+  // nothing inserted during the outage is missed.
+  try {
+    const params = filtersToServerParams({ limit: "200" });
+    if (state.maxId > 0) params.set("since_id", String(state.maxId));
+    const res = await api("/ui/api/requests?" + params.toString());
+    let changed = false;
+    for (const item of res.items) { upsertRow(item); changed = true; }
+    if (changed) { renderRows(); saveCache(); }
+    state.lastSuccess = Date.now();
+    renderStatusPill();
+  } catch (e) {
+    console.warn("backfill failed:", e);
+  }
+}
+
+async function refreshAll() {
+  await Promise.all([refreshStats(), refreshList()]);
+}
+
+// --- websocket client ---
+const wsClient = {
+  sock: null,
+  backoff: 1000,
+  shouldReconnect: true,
+  pingTimer: null,
+
+  isOpen() { return this.sock && this.sock.readyState === 1; },
+
+  reset() {
+    this.shouldReconnect = true;
+    this.backoff = 1000;
+  },
+
+  connect() {
+    if (!apiKey) return;
+    this.shouldReconnect = true;
+    if (this.isOpen()) return;
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${proto}//${location.host}/ui/ws?token=${encodeURIComponent(apiKey)}`;
+    this.setStatus(state.lastSuccess ? "reconnecting" : "connecting");
+    try {
+      this.sock = new WebSocket(url);
+    } catch (_) { this.scheduleReconnect(); return; }
+
+    this.sock.onopen = () => {
+      this.backoff = 1000;
+      this.setStatus("live");
+      backfill();
+    };
+    this.sock.onmessage = (evt) => {
+      let msg;
+      try { msg = JSON.parse(evt.data); } catch (_) { return; }
+      this.onEvent(msg);
+    };
+    this.sock.onerror = () => { /* onclose follows */ };
+    this.sock.onclose = (ev) => {
+      this.sock = null;
+      if (ev && ev.code === 4401) {
+        this.shouldReconnect = false;
+        showLogin(true);
+        return;
+      }
+      if (!this.shouldReconnect) { this.setStatus("offline"); return; }
+      this.scheduleReconnect();
+    };
+  },
+
+  scheduleReconnect() {
+    this.setStatus("reconnecting");
+    const delay = this.backoff;
+    this.backoff = Math.min(this.backoff * 2, 16000);
+    setTimeout(() => { if (this.shouldReconnect) this.connect(); }, delay);
+  },
+
+  setStatus(s) { state.connStatus = s; renderStatusPill(); },
+
+  onEvent(msg) {
+    if (!msg || typeof msg !== "object") return;
+    if (msg.type === "insert" && msg.item) {
+      upsertRow(msg.item);
+      renderRows();
+      saveCache();
+    } else if (msg.type === "delete" && msg.id != null) {
+      removeRow(msg.id);
+      renderRows();
+      saveCache();
+    } else if (msg.type === "hello" || msg.type === "pong") {
+      // keep-alive exchange
+    }
+  },
+
+  ping() {
+    if (!this.isOpen()) return;
+    try { this.sock.send(JSON.stringify({ type: "ping" })); } catch (_) {}
+  },
+
+  close() {
+    this.shouldReconnect = false;
+    if (this.sock) { try { this.sock.close(); } catch (_) {} }
+    this.sock = null;
+    this.setStatus("offline");
+  },
+};
+
+// --- filter UI wiring ---
+function renderTierOptions() {
+  const body = document.getElementById("tier-body");
+  body.innerHTML = TIERS.map(t =>
+    `<label><input type="checkbox" data-tier="${t}" ${state.filters.tiers.has(t) ? "checked" : ""}> ${t}</label>`
+  ).join("");
+  for (const cb of body.querySelectorAll("input[type=checkbox]")) {
+    cb.onchange = () => {
+      const t = cb.dataset.tier;
+      if (cb.checked) state.filters.tiers.add(t);
+      else state.filters.tiers.delete(t);
+      updateTierSummary();
+      saveHash();
+      refreshList();
+    };
+  }
+  updateTierSummary();
+}
+function updateTierSummary() {
+  const s = state.filters.tiers;
+  const label = s.size === 0 ? "tier: any"
+              : s.size <= 2 ? "tier: " + Array.from(s).join(", ")
+              : `tier: ${s.size} selected`;
+  document.querySelector("#tier-multi > summary").textContent = label;
+}
+
+function renderReasonOptions() {
+  const body = document.getElementById("reason-body");
+  const reasons = Array.from(state.reasonsSeen).sort();
+  if (!reasons.length) {
+    body.innerHTML = `<div class="muted" style="font-size:12px;">no reasons seen yet</div>`;
+    updateReasonSummary();
+    return;
+  }
+  body.innerHTML = reasons.map(r =>
+    `<label><input type="checkbox" data-reason="${escapeHtml(r)}" ${state.filters.reasons.has(r) ? "checked" : ""}> ${escapeHtml(r)}</label>`
+  ).join("");
+  for (const cb of body.querySelectorAll("input[type=checkbox]")) {
+    cb.onchange = () => {
+      const r = cb.dataset.reason;
+      if (cb.checked) state.filters.reasons.add(r);
+      else state.filters.reasons.delete(r);
+      updateReasonSummary();
+      saveHash();
+      refreshList();
+    };
+  }
+  updateReasonSummary();
+}
+function updateReasonSummary() {
+  const s = state.filters.reasons;
+  const label = s.size === 0 ? "reason: any"
+              : s.size <= 1 ? "reason: " + Array.from(s).join(", ")
+              : `reason: ${s.size} selected`;
+  document.querySelector("#reason-multi > summary").textContent = label;
+}
+
+function wireToggles() {
+  for (const btn of document.querySelectorAll(".toggle[data-toggle]")) {
+    btn.onclick = () => {
+      const k = btn.dataset.toggle;
+      if (k === "slow") state.filters.slow = !state.filters.slow;
+      else state.filters[k] = state.filters[k] === 1 ? null : 1;
+      renderToggles();
+      saveHash();
+      refreshList();
+    };
+  }
+  renderToggles();
+}
+function renderToggles() {
+  for (const btn of document.querySelectorAll(".toggle[data-toggle]")) {
+    const k = btn.dataset.toggle;
+    const on = k === "slow" ? state.filters.slow : state.filters[k] === 1;
+    btn.classList.toggle("on", on);
+  }
+}
+
+function wireSince() {
+  const sel = document.getElementById("since");
+  const cs = document.getElementById("custom-since");
+  const cu = document.getElementById("custom-until");
+  sel.value = state.filters.since;
+  cs.value  = state.filters.customSince;
+  cu.value  = state.filters.customUntil;
+  const showCustom = state.filters.since === "custom";
+  cs.classList.toggle("hide", !showCustom);
+  cu.classList.toggle("hide", !showCustom);
+  sel.onchange = () => {
+    state.filters.since = sel.value;
+    const sc = state.filters.since === "custom";
+    cs.classList.toggle("hide", !sc);
+    cu.classList.toggle("hide", !sc);
+    saveHash();
+    refreshList();
+  };
+  const onCustom = () => {
+    state.filters.customSince = cs.value;
+    state.filters.customUntil = cu.value;
+    saveHash();
+    refreshList();
+  };
+  cs.onchange = onCustom;
+  cu.onchange = onCustom;
+}
+
+function clearFilters() {
+  state.filters = {
+    q: "", tiers: new Set(), reasons: new Set(),
+    fallback: null, hasSecret: null, isStream: null,
+    slow: false, since: "", customSince: "", customUntil: "",
+  };
+  document.getElementById("q").value = "";
+  document.getElementById("since").value = "";
+  document.getElementById("custom-since").value = "";
+  document.getElementById("custom-until").value = "";
+  document.getElementById("custom-since").classList.add("hide");
+  document.getElementById("custom-until").classList.add("hide");
+  renderTierOptions();
+  renderReasonOptions();
+  renderToggles();
+  saveHash();
+  refreshList();
+}
+
+// --- wire events ---
+const debouncedSearch = debounce(() => {
+  state.filters.q = document.getElementById("q").value.trim();
+  saveHash();
+  refreshList();
+}, 250);
+
+document.getElementById("q").addEventListener("input", debouncedSearch);
+document.getElementById("refresh").addEventListener("click", () => refreshAll());
+document.getElementById("logout").addEventListener("click", logout);
+document.getElementById("filter-clear").addEventListener("click", clearFilters);
+document.getElementById("login-go").addEventListener("click", tryUnlock);
+document.getElementById("login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryUnlock(); });
+
+// Ticks: keep relative timestamps + stale-cache note fresh
+setInterval(() => {
+  if (state.rows.length) renderRows();
+  renderStatusPill();
+}, 15000);
+
+// WebSocket keepalive
+setInterval(() => wsClient.ping(), 25000);
+
+// --- bootstrap ---
+loadHash();
+loadCache();
+document.getElementById("q").value = state.filters.q;
+renderTierOptions();
+renderReasonOptions();
+wireToggles();
+wireSince();
+renderStatusPill();
+renderRows();
+
+if (!apiKey) {
+  showLogin(false);
+} else {
+  refreshAll().then(() => wsClient.connect());
+}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,53 @@
+# Example config — minimal override of the package defaults.
+# Place at /etc/llmrouter/config.yaml inside the container, or set
+# LLMROUTER_CONFIG to wherever you put it.
+#
+# Any top-level section you DON'T set inherits from llmrouter/config.default.yaml.
+# Sections you DO set replace the default wholesale (no deep merge), so make
+# sure to copy any nested values you want to keep.
+
+# Override the default tiers to point at a different stack.
+tiers:
+  cheap:    { model: gpt-4o-mini,  kind: cloud }
+  standard: { model: gpt-4o,       kind: cloud }
+  strong:   { model: claude-opus,  kind: cloud }
+
+fallback:
+  cloud_tier: standard
+  ntfy_on_transition: false   # nothing local to fall back from in this setup
+
+classifier:
+  # No local model in this example — use the legacy heuristic + Haiku tiebreaker.
+  mode: hybrid
+  local_model: ""
+  local_timeout_s: 5
+  tiebreaker_model: gpt-4o-mini
+  complexity_to_tier:
+    1: cheap
+    2: cheap
+    3: standard
+    4: standard
+    5: strong
+  complexity_default_tier: standard
+  secret_tier: cheap                # no local; cheap is the next-best option
+  tiebreaker_to_tier:
+    "1": cheap
+    "2": cheap
+    "3": standard
+    "4": strong
+    "5": strong
+  heuristic_default_tier: standard
+
+heuristic:
+  small_token_threshold: 200
+  small_token_tier: cheap
+  large_token_threshold: 8000
+  large_token_tier: strong
+  tools_tier: standard
+  ambiguous_tier: null
+  secret_hit_tier: cheap
+  step_keywords: ["plan ", "design ", "architect", "refactor"]
+  stopwords: ["the", "and", "for", "with"]
+
+# secret_patterns / metadata_strip_patterns / hysteresis / limits inherit
+# from defaults.
