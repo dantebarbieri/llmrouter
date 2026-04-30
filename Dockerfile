@@ -17,8 +17,17 @@ RUN pip install --no-cache-dir .
 RUN mkdir -p /etc/llmrouter /data \
     && cp /app/llmrouter/config.default.yaml /etc/llmrouter/config.yaml
 
+# Build-time identity: surfaced via /ui/api/version + the UI header pill.
+# Populated by CI (release.yml + preview.yml) via --build-arg.
+ARG LLMROUTER_VERSION=""
+ARG LLMROUTER_GIT_SHA=""
+ARG LLMROUTER_BUILD_REF=""
+
 ENV LLMROUTER_CONFIG=/etc/llmrouter/config.yaml \
-    LLMROUTER_DB_PATH=/data/llmrouter.db
+    LLMROUTER_DB_PATH=/data/llmrouter.db \
+    LLMROUTER_VERSION=${LLMROUTER_VERSION} \
+    LLMROUTER_GIT_SHA=${LLMROUTER_GIT_SHA} \
+    LLMROUTER_BUILD_REF=${LLMROUTER_BUILD_REF}
 
 EXPOSE 8000
 

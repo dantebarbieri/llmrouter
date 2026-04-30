@@ -67,6 +67,10 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag }}
             ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.sha_tag }}
+          build-args: |
+            LLMROUTER_VERSION=${{ steps.tag.outputs.tag }}
+            LLMROUTER_GIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
+            LLMROUTER_BUILD_REF=${{ github.event.pull_request.head.ref || github.event.inputs.ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

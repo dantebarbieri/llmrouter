@@ -25,11 +25,13 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from importlib import metadata as _imeta
 from pathlib import Path
 from typing import Any
 
@@ -1277,6 +1279,34 @@ def _check_auth(authorization: str | None) -> None:
 async def health() -> dict[str, Any]:
     ok = await ollama_healthy()
     return {"status": "ok", "ollama_healthy": ok}
+
+
+def _build_version_info() -> dict[str, Any]:
+    """Resolve build-time identity. Values are set by the Dockerfile via
+    --build-arg, exported as env vars at runtime. In dev (no env) we fall
+    back to package metadata + a "(dev)" sha."""
+    try:
+        pkg_version = _imeta.version("llmrouter")
+    except _imeta.PackageNotFoundError:
+        pkg_version = "0.0.0+unknown"
+    version = os.environ.get("LLMROUTER_VERSION") or pkg_version
+    sha = os.environ.get("LLMROUTER_GIT_SHA") or ""
+    ref = os.environ.get("LLMROUTER_BUILD_REF") or ""
+    return {
+        "version": version,
+        "git_sha": sha,
+        "git_sha_short": sha[:7] if sha else "",
+        "ref": ref,
+        "repo_url": "https://github.com/dantebarbieri/llmrouter",
+    }
+
+
+_VERSION_INFO = _build_version_info()
+
+
+@app.get("/ui/api/version")
+async def get_version() -> dict[str, Any]:
+    return _VERSION_INFO
 
 
 @app.get("/v1/models")
