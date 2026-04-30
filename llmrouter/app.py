@@ -615,6 +615,18 @@ def _tier_rank(tier: str | None) -> int:
     return -1
 
 
+def _tier_kind(tier: str | None) -> str | None:
+    """Return 'local' or 'cloud' for a tier name, or None if unknown.
+
+    Drives UI severity (local upstream errors are user-actionable so we
+    surface them as errors; cloud upstream errors are warnings).
+    """
+    if not tier:
+        return None
+    spec = CFG.tiers.get(tier)
+    return spec.kind if spec else None
+
+
 def _apply_parent_tier_policy(child_tier: str, parent_tier: str | None) -> str:
     """Enforce parent_tier_policy from CFG.threading.
 
@@ -1300,6 +1312,7 @@ def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
         "parent_complexity": row.get("parent_complexity"),
         "parent_tier": row.get("parent_tier"),
         "subcall_summary": row.get("subcall_summary"),
+        "provider_kind": _tier_kind(row.get("tier")),
     }
 
 
@@ -1714,6 +1727,9 @@ async def ui_get_request(
     row = get_request(req_id)
     if not row:
         raise HTTPException(404, "not found")
+    # Annotate with tier→kind so the UI can show error severity for
+    # local-vs-cloud upstream failures without re-deriving config in JS.
+    row["provider_kind"] = _tier_kind(row.get("tier"))
     return row
 
 

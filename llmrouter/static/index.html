@@ -334,6 +334,26 @@
   .thread-chip.orphan[data-thread] { cursor: pointer; }
   .thread-chip.orphan:hover { color: var(--warn); }
   .thread-chip.orphan[data-thread]:hover { border-color: var(--accent); color: var(--fg); }
+  /* Upstream-status badge.
+     Local-tier failures = error (user-actionable: their own Ollama).
+     Cloud-tier failures = warning (provider-side; bot will likely retry). */
+  .upstream-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 7px;
+    margin-left: 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    vertical-align: middle;
+  }
+  .upstream-badge.warn  { color: var(--warn); border-color: var(--warn); }
+  .upstream-badge.error { color: var(--err);  border-color: var(--err); background: rgba(248, 81, 73, 0.08); font-weight: 600; }
+  .row.upstream-error   { border-left: 3px solid var(--err); }
+  .row.upstream-warn    { border-left: 3px solid var(--warn); }
   #thread-view-toggle.active, #originating-only-toggle.active {
     background: var(--accent);
     color: #0d1117;
@@ -542,6 +562,31 @@ function relTime(ts) {
 function tierChip(t) {
   const cls = "tier-" + (t || "none");
   return `<span class="chip ${cls}">${t || "—"}</span>`;
+}
+// Severity classification for upstream HTTP status. We only flag failures.
+//   - status >= 500 OR status in {408, 429}, AND tier kind == 'local'  → error
+//   - status >= 400 (other 4xx) AND local                              → error
+//   - any non-2xx, cloud                                                → warn
+//   - 2xx or null                                                       → null
+function upstreamSeverity(status, providerKind) {
+  if (status == null) return null;
+  if (status < 400) return null;
+  return providerKind === "local" ? "error" : "warn";
+}
+function upstreamLabel(status) {
+  if (status == null) return "";
+  if (status >= 500) return `HTTP ${status} upstream error`;
+  if (status === 429) return `HTTP 429 rate-limited`;
+  if (status === 408) return `HTTP 408 timeout`;
+  if (status >= 400) return `HTTP ${status} bad request`;
+  return `HTTP ${status}`;
+}
+function upstreamBadgeHtml(status, providerKind) {
+  const sev = upstreamSeverity(status, providerKind);
+  if (!sev) return "";
+  const label = upstreamLabel(status);
+  const where = providerKind === "local" ? "local model" : "cloud provider";
+  return ` <span class="upstream-badge ${sev}" title="${escapeHtml(label)} (${where})">⚠ ${status}</span>`;
 }
 function escapeHtml(s) {
   if (s == null) return "";
@@ -807,12 +852,15 @@ function rowHtml(r, opts = {}) {
     const toggleAttr = orphanHasChildren ? ` data-thread="${escapeHtml(r.thread_id)}"` : "";
     threadChip = ` <span class="thread-chip orphan${orphanHasChildren ? (expanded ? " expanded" : "") : ""}"${toggleAttr} title="parent #${opts.originId} not loaded yet${countLabel}">⤴ orphan${count > 0 ? ` ${expanded ? "▾" : "▸"} ${count}` : ""}</span>`;
   }
+  const sev = upstreamSeverity(r.upstream_status, r.provider_kind);
+  const upstreamBadge = upstreamBadgeHtml(r.upstream_status, r.provider_kind);
+  const upstreamRowClass = sev ? ` upstream-${sev}` : "";
   return `
-    <div class="row ${secret} ${threadClass} ${headClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+    <div class="row ${secret} ${threadClass} ${headClass}${upstreamRowClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
       <div class="time" title="${escapeHtml(fmtTime(r.ts))}">${relTime(r.ts)} ago</div>
       <div>${tierChip(r.tier)}<div class="meta">${escapeHtml(r.reason || "")}</div></div>
       <div>
-        <div class="snippet">${escapeHtml(snippet)}${threadChip}</div>
+        <div class="snippet">${escapeHtml(snippet)}${threadChip}${upstreamBadge}</div>
         <div class="meta">${escapeHtml(meta)}</div>
       </div>
       <div class="meta">#${r.id}</div>
@@ -854,12 +902,15 @@ function subcallStepHtml(r, opts = {}) {
     "#" + r.id,
   ].filter(Boolean).join(" · ");
   const lastClass = opts.lastStep ? " last-step" : "";
+  const stepSev = upstreamSeverity(r.upstream_status, r.provider_kind);
+  const upstreamBadge = upstreamBadgeHtml(r.upstream_status, r.provider_kind);
+  const upstreamRowClass = stepSev ? ` upstream-${stepSev}` : "";
   return `
-    <div class="row subcall-step${lastClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+    <div class="row subcall-step${lastClass}${upstreamRowClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
       <div>${tierChip(r.tier)}</div>
       <div class="step-icon">${icon}</div>
       <div class="step-body">
-        <div class="step-headline">${headlineParts.join(" ")}</div>
+        <div class="step-headline">${headlineParts.join(" ")}${upstreamBadge}</div>
         ${preamble}
       </div>
       <div class="step-meta">${escapeHtml(stepMeta)}</div>
@@ -1205,7 +1256,17 @@ function renderDetail(r) {
       ${kv("target", `<code>${escapeHtml(r.target_model || "—")}</code>`)}
       ${kv("reason", `<code>${escapeHtml(r.reason || "—")}</code>`)}
       ${kv("duration", (r.duration_ms == null ? "—" : r.duration_ms + " ms"))}
-      ${kv("upstream", r.upstream_status || "—")}
+      ${kv("upstream", (() => {
+        if (r.upstream_status == null) return "—";
+        const sev = upstreamSeverity(r.upstream_status, r.provider_kind);
+        if (!sev) return String(r.upstream_status);
+        const label = upstreamLabel(r.upstream_status);
+        const where = r.provider_kind === "local"
+          ? "your local model (Ollama). Check that the model is loaded and responsive."
+          : "the cloud provider. Likely transient / rate limit; the bot may retry.";
+        const cls = sev === "error" ? "err" : "";
+        return `<span class="${cls}" title="${escapeHtml(where)}"><b>${r.upstream_status}</b> — ${escapeHtml(label)} (${r.provider_kind || "unknown"})</span>`;
+      })())}
       ${kv("stream", r.is_stream ? "yes" : "no")}
       ${kv("fallback", r.fallback_applied ? '<span class="err">yes (ollama unreachable)</span>' : "no")}
     </div>
