@@ -30,6 +30,7 @@ import re
 import secrets
 import sqlite3
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from importlib import metadata as _imeta
 from pathlib import Path
@@ -1209,6 +1210,9 @@ def stats() -> dict[str, Any]:
 
 _HUB_QUEUE_MAX = 100
 _hub_clients: set[asyncio.Queue] = set()
+# Strong refs to in-flight persist-and-publish background tasks so they're not
+# garbage-collected mid-execution when a streaming response is cancelled.
+_pending_persist_tasks: set[asyncio.Task] = set()
 
 
 async def _hub_publish(event: dict[str, Any]) -> None:
@@ -1217,6 +1221,53 @@ async def _hub_publish(event: dict[str, Any]) -> None:
             q.put_nowait(event)
         except asyncio.QueueFull:
             LOG.debug("hub: dropping event for slow client (queue full)")
+
+
+async def _persist_and_publish(
+    base_row: dict[str, Any],
+    is_subcall: bool,
+    thread_id: str | None,
+    t0: float,
+    finalize: Callable[[int | None], Awaitable[None]] | None = None,
+) -> None:
+    """Insert the request row, finalize thread state, and publish a hub event.
+
+    Designed to run as a detached background task so that streaming-response
+    cancellation (e.g., upstream 5xx with caller abort) cannot interrupt the
+    persist-then-publish sequence partway through. Logs and swallows errors.
+    """
+    try:
+        base_row["duration_ms"] = int((time.time() - t0) * 1000)
+        inserted_id = await asyncio.to_thread(log_request, base_row)
+        if inserted_id is None:
+            return
+        if not is_subcall and thread_id:
+            base_row["origin_request_id"] = inserted_id
+        if finalize is not None:
+            with contextlib.suppress(Exception):
+                await finalize(inserted_id)
+        await _hub_publish({
+            "type": "insert",
+            "id": inserted_id,
+            "item": _project_list_item(inserted_id, base_row),
+        })
+    except Exception as e:  # noqa: BLE001 — must not crash the loop
+        LOG.warning("persist_and_publish failed: %s", e)
+
+
+def _spawn_persist(
+    base_row: dict[str, Any],
+    is_subcall: bool,
+    thread_id: str | None,
+    t0: float,
+    finalize: Callable[[int | None], Awaitable[None]] | None = None,
+) -> asyncio.Task:
+    task = asyncio.create_task(
+        _persist_and_publish(base_row, is_subcall, thread_id, t0, finalize),
+    )
+    _pending_persist_tasks.add(task)
+    task.add_done_callback(_pending_persist_tasks.discard)
+    return task
 
 
 def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
@@ -1561,17 +1612,12 @@ async def chat_completions(
     if not is_stream:
         data = await upstream.aread()
         await client.aclose()
-        base_row["duration_ms"] = int((time.time() - t0) * 1000)
-        inserted_id = await asyncio.to_thread(log_request, base_row)
-        if inserted_id is not None:
-            if not is_subcall and thread_id:
-                base_row["origin_request_id"] = inserted_id
-            await _finalize_thread_state(inserted_id)
-            await _hub_publish({
-                "type": "insert",
-                "id": inserted_id,
-                "item": _project_list_item(inserted_id, base_row),
-            })
+        # Run persist+publish as a shielded background task so that a caller
+        # cancelling the response after we've decided what to log doesn't
+        # leave the row uninserted or unpublished.
+        persist = _spawn_persist(base_row, is_subcall, thread_id, t0, _finalize_thread_state)
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(persist)
         try:
             content = json.loads(data) if data else {}
         except json.JSONDecodeError:
@@ -1589,17 +1635,11 @@ async def chat_completions(
         finally:
             await upstream.aclose()
             await client.aclose()
-            base_row["duration_ms"] = int((time.time() - t0) * 1000)
-            inserted_id = await asyncio.to_thread(log_request, base_row)
-            if inserted_id is not None:
-                if not is_subcall and thread_id:
-                    base_row["origin_request_id"] = inserted_id
-                await _finalize_thread_state(inserted_id)
-                await _hub_publish({
-                    "type": "insert",
-                    "id": inserted_id,
-                    "item": _project_list_item(inserted_id, base_row),
-                })
+            # Detach persistence from the streaming generator's lifetime: if
+            # the caller aborts mid-stream (or upstream returned 5xx and the
+            # caller hangs up), our cancellation must not prevent the row
+            # from being inserted and broadcast.
+            _spawn_persist(base_row, is_subcall, thread_id, t0, _finalize_thread_state)
 
     return StreamingResponse(
         iter_chunks(),
