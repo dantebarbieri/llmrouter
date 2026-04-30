@@ -948,7 +948,39 @@ _REQUESTS_ADDED_COLUMNS: list[tuple[str, str]] = [
     # so the UI can render a trajectory tree without repeating the user
     # prompt. NULL for originating rows and pre-threading rows.
     ("subcall_summary", "TEXT"),
+    # Retry de-duplication. `request_hash` is a stable digest of
+    # (requested_model, thread_id, messages_full); rows with matching hashes
+    # within `RETRY_DEDUPE_WINDOW_S` are treated as retries of the earliest
+    # row in the chain. `retry_of` points at the head row id (NULL when the
+    # row is itself the head, or when dedupe is disabled).
+    ("request_hash", "TEXT"),
+    ("retry_of", "INTEGER"),
 ]
+
+
+# Retries inside this window collapse onto the earliest matching request.
+# OpenClaw's failure-retry bursts fire within ~10s; 5min handles slow chains.
+RETRY_DEDUPE_WINDOW_S = 300.0
+
+
+def _compute_request_hash(
+    messages_full: str | None,
+    requested_model: str | None,
+    thread_id: str | None,
+) -> str | None:
+    """Stable digest used to detect retries of the same request body.
+
+    Returns None when there is no body to hash (e.g., logging disabled).
+    """
+    if not messages_full:
+        return None
+    h = hashlib.sha256()
+    h.update((requested_model or "").encode("utf-8"))
+    h.update(b"\x00")
+    h.update((thread_id or "").encode("utf-8"))
+    h.update(b"\x00")
+    h.update(messages_full.encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 def _migrate_requests_schema(conn: sqlite3.Connection) -> None:
@@ -1045,13 +1077,32 @@ def extract_keywords(text: str, max_n: int = 30) -> list[str]:
 
 
 def log_request(row: dict[str, Any]) -> int | None:
-    """Insert a request row and return its new id, or None if logging is off."""
+    """Insert a request row and return its new id, or None if logging is off.
+
+    Performs retry-of detection inside the same transaction: if `request_hash`
+    is set on the row and a prior row with the same hash exists within the
+    dedupe window, this row's `retry_of` is set to the head of that chain.
+    """
     if not ENV.log_requests:
         return None
     try:
         _init_db()
         conn = sqlite3.connect(ENV.db_path, check_same_thread=False, timeout=5.0)
         try:
+            req_hash = row.get("request_hash")
+            ts = row.get("ts")
+            if req_hash and ts is not None and row.get("retry_of") is None:
+                cutoff = float(ts) - RETRY_DEDUPE_WINDOW_S
+                conn.row_factory = sqlite3.Row
+                prior = conn.execute(
+                    "SELECT id, retry_of FROM requests "
+                    "WHERE request_hash = ? AND ts >= ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (req_hash, cutoff),
+                ).fetchone()
+                if prior is not None:
+                    row["retry_of"] = prior["retry_of"] or prior["id"]
+                conn.row_factory = None
             keys = list(row.keys())
             cur = conn.execute(
                 f"INSERT INTO requests ({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
@@ -1097,6 +1148,7 @@ def search_requests(
     since: float | None = None,
     until: float | None = None,
     since_id: int | None = None,
+    include_retries: bool = False,
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -1148,6 +1200,8 @@ def search_requests(
         if since_id is not None:
             where.append("requests.id > ?")
             params.append(since_id)
+        if not include_retries:
+            where.append("requests.retry_of IS NULL")
         where_sql = f" WHERE {' AND '.join(where)}" if where else ""
 
         total = int(conn.execute(
@@ -1168,17 +1222,29 @@ def search_requests(
                        requests.thread_role, requests.parent_complexity,
                        requests.parent_tier,
                        requests.subcall_summary,
+                       requests.local_classifier_error,
+                       requests.retry_of,
+                       (SELECT COUNT(*) FROM requests r2
+                          WHERE r2.retry_of = requests.id) AS retry_count,
                        substr(coalesce(requests.messages_preview, ''), 1, 240) AS snippet
                 FROM requests {joins}{where_sql}
                 ORDER BY requests.ts DESC
                 LIMIT ? OFFSET ?""",
             [*params, limit, offset],
         ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            # Annotate provider kind so the UI can colour upstream-error
+            # severity (local → error, cloud → warn) without re-deriving
+            # config in JS. Mirrors `_project_list_item` for hub events.
+            d["provider_kind"] = _tier_kind(d.get("tier"))
+            items.append(d)
         return {
             "total": total,
             "limit": limit,
             "offset": offset,
-            "items": [dict(r) for r in rows],
+            "items": items,
         }
     finally:
         conn.close()
@@ -1312,7 +1378,10 @@ def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
         "parent_complexity": row.get("parent_complexity"),
         "parent_tier": row.get("parent_tier"),
         "subcall_summary": row.get("subcall_summary"),
+        "local_classifier_error": row.get("local_classifier_error"),
         "provider_kind": _tier_kind(row.get("tier")),
+        "retry_of": row.get("retry_of"),
+        "retry_count": int(row.get("retry_count") or 0),
     }
 
 
@@ -1432,7 +1501,8 @@ async def chat_completions(
 
     if requested == "auto":
         used_local = False
-        if CFG.classifier.mode == "local" and await ollama_healthy():
+        classifier_local_attempted = CFG.classifier.mode == "local"
+        if classifier_local_attempted and await ollama_healthy():
             try:
                 l_secret, l_complex, local_details = await asyncio.wait_for(
                     local_classify(body, classification_text=classify_text),
@@ -1458,6 +1528,18 @@ async def chat_completions(
                 else:
                     local_details["error"] = err_str
                 classifier_source = "fallback"
+        elif classifier_local_attempted:
+            # Ollama health check failed before we even tried to classify.
+            # Record this so the UI can flag the row as "classifier
+            # degraded" — without it, the row looks like an intentional
+            # heuristic/haiku call and the user has no signal that a
+            # local provider is unreachable.
+            local_details = {
+                "prompt": None,
+                "response": None,
+                "error": "ollama unreachable (health check failed at classification time)",
+            }
+            classifier_source = "fallback"
 
         if not used_local:
             if heuristic is not None:
@@ -1587,6 +1669,8 @@ async def chat_completions(
         "parent_tier": parent_tier_for_log,
         "subcall_summary": json.dumps(subcall_summary_obj, ensure_ascii=False)
         if subcall_summary_obj else None,
+        "request_hash": _compute_request_hash(messages_full, requested, thread_id),
+        "retry_of": None,
     }
 
     async def _finalize_thread_state(inserted_id: int | None) -> None:

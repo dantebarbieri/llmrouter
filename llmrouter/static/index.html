@@ -354,6 +354,19 @@
   .upstream-badge.error { color: var(--err);  border-color: var(--err); background: rgba(248, 81, 73, 0.08); font-weight: 600; }
   .row.upstream-error   { border-left: 3px solid var(--err); }
   .row.upstream-warn    { border-left: 3px solid var(--warn); }
+  .retry-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 7px;
+    margin-left: 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+    border: 1px solid var(--muted);
+    color: var(--muted);
+    vertical-align: middle;
+  }
   #thread-view-toggle.active, #originating-only-toggle.active {
     background: var(--accent);
     color: #0d1117;
@@ -587,6 +600,23 @@ function upstreamBadgeHtml(status, providerKind) {
   const label = upstreamLabel(status);
   const where = providerKind === "local" ? "local model" : "cloud provider";
   return ` <span class="upstream-badge ${sev}" title="${escapeHtml(label)} (${where})">⚠ ${status}</span>`;
+}
+// Surface routing/classifier degradation that isn't an HTTP status code:
+// - fallback_applied: chat completion was redirected from a local tier to a
+//   cloud tier because Ollama was unreachable. Treated as an error because
+//   the user can usually fix it locally (start Ollama).
+// - local_classifier_error: classifier path couldn't reach Ollama (or it
+//   timed out / errored). Treated as a warning — routing still happened
+//   via heuristic/haiku, just without the local LLM signal.
+function routingBadgesHtml(r) {
+  const parts = [];
+  if (r.fallback_applied) {
+    parts.push(' <span class="upstream-badge error" title="local tier unreachable; routed to cloud fallback">↯ local unreachable</span>');
+  }
+  if (r.local_classifier_error) {
+    parts.push(` <span class="upstream-badge warn" title="classifier degraded: ${escapeHtml(String(r.local_classifier_error).slice(0, 200))}">⚠ classifier degraded</span>`);
+  }
+  return parts.join("");
 }
 function escapeHtml(s) {
   if (s == null) return "";
@@ -854,13 +884,21 @@ function rowHtml(r, opts = {}) {
   }
   const sev = upstreamSeverity(r.upstream_status, r.provider_kind);
   const upstreamBadge = upstreamBadgeHtml(r.upstream_status, r.provider_kind);
-  const upstreamRowClass = sev ? ` upstream-${sev}` : "";
+  const routingBadges = routingBadgesHtml(r);
+  const retryBadge = (r.retry_count && r.retry_count > 0)
+    ? ` <span class="retry-badge" title="${r.retry_count} duplicate retry request${r.retry_count === 1 ? "" : "s"} collapsed onto this row">↻ ×${r.retry_count + 1}</span>`
+    : "";
+  // If the row has no upstream HTTP error but the router itself fell back
+  // off a local tier, treat the whole row as an error so the red left
+  // border kicks in. Classifier degradation alone stays a soft warn.
+  const effectiveSev = sev || (r.fallback_applied ? "error" : (r.local_classifier_error ? "warn" : null));
+  const upstreamRowClass = effectiveSev ? ` upstream-${effectiveSev}` : "";
   return `
     <div class="row ${secret} ${threadClass} ${headClass}${upstreamRowClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
       <div class="time" title="${escapeHtml(fmtTime(r.ts))}">${relTime(r.ts)} ago</div>
       <div>${tierChip(r.tier)}<div class="meta">${escapeHtml(r.reason || "")}</div></div>
       <div>
-        <div class="snippet">${escapeHtml(snippet)}${threadChip}${upstreamBadge}</div>
+        <div class="snippet">${escapeHtml(snippet)}${threadChip}${upstreamBadge}${routingBadges}${retryBadge}</div>
         <div class="meta">${escapeHtml(meta)}</div>
       </div>
       <div class="meta">#${r.id}</div>
@@ -904,13 +942,15 @@ function subcallStepHtml(r, opts = {}) {
   const lastClass = opts.lastStep ? " last-step" : "";
   const stepSev = upstreamSeverity(r.upstream_status, r.provider_kind);
   const upstreamBadge = upstreamBadgeHtml(r.upstream_status, r.provider_kind);
-  const upstreamRowClass = stepSev ? ` upstream-${stepSev}` : "";
+  const routingBadges = routingBadgesHtml(r);
+  const effectiveSev = stepSev || (r.fallback_applied ? "error" : (r.local_classifier_error ? "warn" : null));
+  const upstreamRowClass = effectiveSev ? ` upstream-${effectiveSev}` : "";
   return `
     <div class="row subcall-step${lastClass}${upstreamRowClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
       <div>${tierChip(r.tier)}</div>
       <div class="step-icon">${icon}</div>
       <div class="step-body">
-        <div class="step-headline">${headlineParts.join(" ")}${upstreamBadge}</div>
+        <div class="step-headline">${headlineParts.join(" ")}${upstreamBadge}${routingBadges}</div>
         ${preamble}
       </div>
       <div class="step-meta">${escapeHtml(stepMeta)}</div>
@@ -1084,6 +1124,28 @@ function renderRows() {
 
 // --- list state mutation ---
 function upsertRow(item) {
+  // Retries collapse onto the head: don't add the duplicate to the list,
+  // just bump the head's retry_count locally so the badge updates live.
+  if (item.retry_of != null) {
+    const headIdx = state.rows.findIndex(r => r.id === item.retry_of);
+    if (headIdx >= 0) {
+      const head = state.rows[headIdx];
+      state.rows[headIdx] = {
+        ...head,
+        retry_count: (head.retry_count || 0) + 1,
+      };
+      if (item.id > state.maxId) state.maxId = item.id;
+      return;
+    }
+    // Head not loaded yet — pull it in. The list query already filters
+    // retries out of the historical window, so this is the only path
+    // by which the head ever appears.
+    if (!state.rows.some(r => r.id === item.retry_of)) {
+      fetchAndInjectRow(item.retry_of);
+    }
+    if (item.id > state.maxId) state.maxId = item.id;
+    return;
+  }
   const idx = state.rows.findIndex(r => r.id === item.id);
   if (idx >= 0) {
     state.rows[idx] = { ...state.rows[idx], ...item };
