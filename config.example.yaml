@@ -1,53 +1,200 @@
-# Example config — minimal override of the package defaults.
-# Place at /etc/llmrouter/config.yaml inside the container, or set
-# LLMROUTER_CONFIG to wherever you put it.
+# Example llmrouter configuration — identical to the in-package defaults
+# in llmrouter/config.default.yaml. Copy this to /etc/llmrouter/config.yaml
+# (or wherever LLMROUTER_CONFIG points) and edit to taste.
 #
-# Any top-level section you DON'T set inherits from llmrouter/config.default.yaml.
-# Sections you DO set replace the default wholesale (no deep merge), so make
-# sure to copy any nested values you want to keep.
+# The tier `model:` strings here (qwen-local, claude-haiku, claude-sonnet,
+# claude-opus, qwen-local-thinking, qwen-local-classifier) are LiteLLM
+# `model_name` aliases — llmrouter forwards them to LiteLLM verbatim. If
+# your LiteLLM config uses different alias names, change them to match.
+#
+# Loader semantics: any top-level section you OMIT inherits from the package
+# defaults; any section you SET replaces the default for that section
+# wholesale (no deep merge). So if you want to keep most of `heuristic` but
+# change one field, copy the whole block and edit the field.
 
-# Override the default tiers to point at a different stack.
+# Tier definitions. Each key is a logical tier name; `model` is the upstream
+# model id passed to LiteLLM when this tier is selected; `kind` is `local`
+# (subject to Ollama health gating + cloud fallback) or `cloud`.
 tiers:
-  cheap:    { model: gpt-4o-mini,  kind: cloud }
-  standard: { model: gpt-4o,       kind: cloud }
-  strong:   { model: claude-opus,  kind: cloud }
+  local:           { model: qwen-local,           kind: local }
+  local-thinking:  { model: qwen-local-thinking,  kind: local }
+  haiku:           { model: claude-haiku,         kind: cloud }
+  sonnet:          { model: claude-sonnet,        kind: cloud }
+  opus:            { model: claude-opus,          kind: cloud }
 
 fallback:
-  cloud_tier: standard
-  ntfy_on_transition: false   # nothing local to fall back from in this setup
+  # Tier to redirect to when a `local`-kind tier is selected but Ollama is
+  # unreachable. Must be a `cloud`-kind tier.
+  cloud_tier: sonnet
+  # Send an ntfy alert on local→unhealthy and unhealthy→recovered transitions.
+  ntfy_on_transition: true
 
 classifier:
-  # No local model in this example — use the legacy heuristic + Haiku tiebreaker.
-  mode: hybrid
-  local_model: ""
-  local_timeout_s: 5
-  tiebreaker_model: gpt-4o-mini
+  # local: one call to a local LLM returns {has_secret, secret_values, complexity}.
+  # hybrid|haiku: skip local LLM, use heuristic + Haiku tiebreaker.
+  mode: local
+  local_model: qwen-local-classifier
+  local_timeout_s: 5.0
+  tiebreaker_model: claude-haiku
+  # Map classifier complexity score → tier. has_secret=true overrides to
+  # `secret_tier` regardless of complexity.
   complexity_to_tier:
-    1: cheap
-    2: cheap
-    3: standard
-    4: standard
-    5: strong
-  complexity_default_tier: standard
-  secret_tier: cheap                # no local; cheap is the next-best option
+    1: local
+    2: local
+    3: local-thinking
+    4: sonnet
+    5: opus
+  # Default tier used when complexity is missing/unparseable.
+  complexity_default_tier: sonnet
+  # Tier used whenever the (regex OR LLM) secret signal fires.
+  secret_tier: local
+  # Mapping from the Haiku tiebreaker's 1-5 digit response → tier (legacy).
   tiebreaker_to_tier:
-    "1": cheap
-    "2": cheap
-    "3": standard
-    "4": strong
-    "5": strong
-  heuristic_default_tier: standard
+    "1": local-thinking
+    "2": local-thinking
+    "3": sonnet
+    "4": opus
+    "5": opus
+  # Tier the heuristic falls back to when nothing matched and no tiebreaker
+  # ran (i.e. classifier.mode is some custom non-local/hybrid/haiku value).
+  heuristic_default_tier: local-thinking
 
+# Heuristic classifier inputs.
 heuristic:
+  # Approximate-token thresholds: requests above `large_token_threshold` go to
+  # `large_token_tier`; requests below `small_token_threshold` (with no code
+  # fence and no step keyword) go to `small_token_tier`.
   small_token_threshold: 200
-  small_token_tier: cheap
+  small_token_tier: local
   large_token_threshold: 8000
-  large_token_tier: strong
-  tools_tier: standard
+  large_token_tier: sonnet
+  # When body has tools/functions/tool_choice, route to this tier.
+  tools_tier: sonnet
+  # Tier used when has_code or step_keyword matches but no other rule fires
+  # — null means "fall through to tiebreaker".
   ambiguous_tier: null
-  secret_hit_tier: cheap
-  step_keywords: ["plan ", "design ", "architect", "refactor"]
-  stopwords: ["the", "and", "for", "with"]
+  # Tier used when a regex secret pattern hits.
+  secret_hit_tier: local-thinking
+  # Words that trigger a "this is a planning/reasoning ask" signal.
+  step_keywords:
+    - "plan "
+    - "design "
+    - "architect"
+    - "refactor"
+    - "debug"
+    - "implement"
+    - "analyze"
+    - "investigate"
+  # Stopwords excluded from FTS keyword extraction.
+  stopwords:
+    - about
+    - above
+    - after
+    - again
+    - against
+    - also
+    - another
+    - been
+    - before
+    - being
+    - below
+    - between
+    - both
+    - could
+    - does
+    - doing
+    - down
+    - during
+    - each
+    - every
+    - from
+    - further
+    - have
+    - having
+    - here
+    - itself
+    - just
+    - like
+    - many
+    - might
+    - more
+    - most
+    - much
+    - once
+    - only
+    - other
+    - over
+    - same
+    - should
+    - some
+    - such
+    - than
+    - that
+    - their
+    - them
+    - then
+    - there
+    - these
+    - they
+    - this
+    - those
+    - through
+    - under
+    - until
+    - very
+    - were
+    - what
+    - when
+    - where
+    - which
+    - while
+    - with
+    - would
+    - your
+    - yours
 
-# secret_patterns / metadata_strip_patterns / hysteresis / limits inherit
-# from defaults.
+# Regex patterns for credential/secret detection. `flags` is any subset of
+# [IGNORECASE, MULTILINE, DOTALL]. Each match is replaced with
+# `[REDACTED:<name>]` in the log preview.
+secret_patterns:
+  - name: credential_assignment
+    pattern: '\b(?:password|passwd|secret|api[_-]?key|apikey|access[_-]?token|auth[_-]?token|credential|private[_-]?key)s?\s*[:=]\s*\S{4,}'
+    flags: [IGNORECASE]
+  - name: bearer_token
+    pattern: '\bbearer\s+[A-Za-z0-9._\-]{16,}'
+    flags: [IGNORECASE]
+  - name: ssh_public_key
+    pattern: '\bssh-(?:rsa|ed25519|dss)\s+[A-Za-z0-9+/=]{40,}'
+    flags: []
+  - name: pem_private_key
+    pattern: '-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+    flags: []
+  - name: dotenv_reference
+    pattern: '(?:^|\s)\.env(?:$|[\s:=])'
+    flags: []
+
+# Optional: framework metadata blocks the classifier should strip from the
+# user prompt before scoring complexity (e.g. OpenClaw's "Conversation info
+# (untrusted metadata):" fenced JSON blocks). Each entry is a regex; matches
+# are replaced with a single newline.
+metadata_strip_patterns:
+  - pattern: '^[^\n]{1,120}\(untrusted metadata\):\s*\n```(?:json)?\s*\n.*?\n```[ \t]*\n?'
+    flags: [DOTALL, IGNORECASE, MULTILINE]
+
+# Per-conversation tier hysteresis to avoid Ollama hot-swap thrash between
+# the Instruct and Thinking models. Keyed off the chat_id pulled from the
+# `chat_id_pattern` regex (must contain a single capture group).
+hysteresis:
+  enabled: true
+  ttl_s: 600
+  chat_id_pattern: '"chat_id"\s*:\s*"([^"]+)"'
+  # When a chat's last routed tier is `local-thinking` and the next request
+  # is classified as `local`, keep it on `local-thinking` (within TTL).
+  sticky_pairs:
+    - { from_prev: local-thinking, when_now: local, keep: local-thinking }
+
+# Health probe + log limits.
+limits:
+  health_ttl_s: 5.0
+  messages_preview_chars: 4000
+  messages_full_max_chars: 200000
