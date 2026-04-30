@@ -1,16 +1,24 @@
-# Example llmrouter configuration — identical to the in-package defaults
-# in llmrouter/config.default.yaml. Copy this to /etc/llmrouter/config.yaml
-# (or wherever LLMROUTER_CONFIG points) and edit to taste.
+# Example llmrouter configuration. Verbatim copy of the in-package defaults
+# in llmrouter/config.default.yaml — drop this at the path pointed to by
+# LLMROUTER_CONFIG (e.g. /etc/llmrouter/config.yaml) and edit to taste.
 #
-# The tier `model:` strings here (qwen-local, claude-haiku, claude-sonnet,
-# claude-opus, qwen-local-thinking, qwen-local-classifier) are LiteLLM
-# `model_name` aliases — llmrouter forwards them to LiteLLM verbatim. If
-# your LiteLLM config uses different alias names, change them to match.
+# This file is intended as a known-good starting point that reproduces a
+# typical setup with:
+#   - a LiteLLM proxy in front (using model_name aliases below)
+#   - an Ollama instance hosting two Qwen3-30B variants (Instruct + Thinking)
+#     plus a smaller qwen3:4b for the classifier
+#   - Anthropic claude-haiku / claude-sonnet / claude-opus as cloud tiers
+#
+# Tier `model:` strings (qwen-local, qwen-local-thinking, qwen-local-classifier,
+# claude-haiku, claude-sonnet, claude-opus) are LiteLLM `model_name` aliases —
+# llmrouter forwards them to LiteLLM verbatim. If your LiteLLM `model_list`
+# uses different aliases, change the strings here to match. The `kind:` field
+# (local/cloud) is what llmrouter uses for health gating + cloud fallback.
 #
 # Loader semantics: any top-level section you OMIT inherits from the package
 # defaults; any section you SET replaces the default for that section
-# wholesale (no deep merge). So if you want to keep most of `heuristic` but
-# change one field, copy the whole block and edit the field.
+# wholesale (no deep merge). To tweak a single field inside `heuristic`, copy
+# the whole `heuristic:` block from this file and edit the field you want.
 
 # Tier definitions. Each key is a logical tier name; `model` is the upstream
 # model id passed to LiteLLM when this tier is selected; `kind` is `local`

@@ -11,3 +11,4 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+ignore/
