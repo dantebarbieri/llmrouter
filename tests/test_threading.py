@@ -280,7 +280,6 @@ def test_build_classification_subcall_isolation_off(monkeypatch: pytest.MonkeyPa
 # --- _claim_thread_state (admission-time race safety) ---------------------
 
 
-@pytest.mark.asyncio
 async def test_claim_first_request_is_originating(monkeypatch: pytest.MonkeyPatch):
     _enable_threading(monkeypatch)
     monkeypatch.setattr(app, "_THREAD_STATE", {})
@@ -289,7 +288,6 @@ async def test_claim_first_request_is_originating(monkeypatch: pytest.MonkeyPatc
     assert state["origin_request_id"] is None
 
 
-@pytest.mark.asyncio
 async def test_claim_after_record_is_subcall(monkeypatch: pytest.MonkeyPatch):
     _enable_threading(monkeypatch)
     monkeypatch.setattr(app, "_THREAD_STATE", {})
@@ -308,7 +306,6 @@ async def test_claim_after_record_is_subcall(monkeypatch: pytest.MonkeyPatch):
     assert second["previous_complexity"] == 4
 
 
-@pytest.mark.asyncio
 async def test_claim_after_ttl_is_originating_again(monkeypatch: pytest.MonkeyPatch):
     _enable_threading(monkeypatch, ttl_s=10.0)
     monkeypatch.setattr(app, "_THREAD_STATE", {})

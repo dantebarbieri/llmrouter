@@ -325,6 +325,8 @@
   </select>
   <input type="datetime-local" id="custom-since" class="hide" title="from" />
   <input type="datetime-local" id="custom-until" class="hide" title="to" />
+  <button id="thread-view-toggle" title="group sub-calls under their originating request" type="button">tree</button>
+  <button id="originating-only-toggle" title="hide sub-calls; show only originating requests" type="button">originating only</button>
   <button id="filter-clear" title="clear all filters">clear</button>
 </div>
 
@@ -376,6 +378,8 @@ const state = {
   connStatus: "connecting", // connecting | live | reconnecting | offline
   lastSuccess: 0,
   reasonsSeen: new Set(),   // populated from list results + stats
+  threadView: false,        // true → group sub-calls under originating row
+  expandedThreads: new Set(),
   filters: {
     q: "",
     tiers: new Set(),
@@ -387,6 +391,7 @@ const state = {
     since: "",        // "" | seconds | "custom"
     customSince: "",  // datetime-local value
     customUntil: "",
+    originatingOnly: false,
   },
 };
 
@@ -647,28 +652,43 @@ function rowHtml(r, opts = {}) {
 // originating row in the current view are shown standalone (so filters that
 // hide the parent don't make sub-calls disappear).
 function buildTreeView(visible) {
+  // First pass: collect originating rows + sub-calls for every visible
+  // thread regardless of order. Visible is newest-first, so a sub-call
+  // typically appears BEFORE its originating row.
   const byThread = new Map(); // thread_id -> { originating, subcalls: [] }
-  const orphanSubcalls = [];
-  const order = [];           // ordered list of {kind:"orig"|"orphan", item, group?}
+  for (const r of visible) {
+    if (!r.thread_id || !state.threadView) continue;
+    let grp = byThread.get(r.thread_id);
+    if (!grp) {
+      grp = { originating: null, subcalls: [] };
+      byThread.set(r.thread_id, grp);
+    }
+    if (r.thread_role === "originating") {
+      grp.originating = r;
+    } else if (r.thread_role === "subcall") {
+      grp.subcalls.push(r);
+    }
+  }
+
+  // Second pass: emit rows in the existing visible order, but only once
+  // per thread. If the originating row is visible, render the thread under
+  // that row even when sub-calls appeared earlier in the list. Threads
+  // without a visible originating row keep their sub-calls standalone.
+  const order = [];
+  const emittedThreads = new Set();
   for (const r of visible) {
     if (!r.thread_id || !state.threadView) {
       order.push({ kind: "single", item: r });
       continue;
     }
-    if (r.thread_role === "originating") {
-      const grp = { originating: r, subcalls: [] };
-      byThread.set(r.thread_id, grp);
-      order.push({ kind: "orig", item: r, group: grp });
-    } else if (r.thread_role === "subcall") {
-      const grp = byThread.get(r.thread_id);
-      if (grp) {
-        grp.subcalls.push(r);
-      } else {
-        order.push({ kind: "single", item: r });
-      }
-    } else {
+    const grp = byThread.get(r.thread_id);
+    if (!grp || !grp.originating) {
       order.push({ kind: "single", item: r });
+      continue;
     }
+    if (emittedThreads.has(r.thread_id)) continue;
+    emittedThreads.add(r.thread_id);
+    order.push({ kind: "orig", item: grp.originating, group: grp });
   }
   return order;
 }
@@ -1211,18 +1231,24 @@ document.getElementById("filter-clear").addEventListener("click", clearFilters);
 document.getElementById("login-go").addEventListener("click", tryUnlock);
 document.getElementById("login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryUnlock(); });
 
-document.getElementById("thread-view-toggle").addEventListener("click", () => {
-  state.threadView = !state.threadView;
-  if (!state.threadView) state.expandedThreads.clear();
-  renderThreadingToggles();
-  renderRows();
-});
-document.getElementById("originating-only-toggle").addEventListener("click", () => {
-  state.filters.originatingOnly = !state.filters.originatingOnly;
-  renderThreadingToggles();
-  saveHash();
-  renderRows();
-});
+const threadViewToggle = document.getElementById("thread-view-toggle");
+if (threadViewToggle) {
+  threadViewToggle.addEventListener("click", () => {
+    state.threadView = !state.threadView;
+    if (!state.threadView) state.expandedThreads.clear();
+    renderThreadingToggles();
+    renderRows();
+  });
+}
+const originatingOnlyToggle = document.getElementById("originating-only-toggle");
+if (originatingOnlyToggle) {
+  originatingOnlyToggle.addEventListener("click", () => {
+    state.filters.originatingOnly = !state.filters.originatingOnly;
+    renderThreadingToggles();
+    saveHash();
+    renderRows();
+  });
+}
 renderThreadingToggles();
 
 // Ticks: keep relative timestamps + stale-cache note fresh

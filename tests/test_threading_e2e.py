@@ -7,7 +7,6 @@ Uses FastAPI's TestClient + httpx mocking pattern: monkeypatch
 """
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import sqlite3
@@ -26,16 +25,18 @@ from llmrouter.config import ThreadExtractorSpec, ThreadingSpec
 
 @pytest.fixture
 def isolated_db(monkeypatch: pytest.MonkeyPatch):
-    """Point the app at a fresh sqlite file and re-init the schema."""
-    tmpdir = tempfile.mkdtemp(prefix="llmrouter-e2e-")
-    db_path = os.path.join(tmpdir, f"e2e-{uuid.uuid4().hex}.db")
-    new_env = app.ENV.model_copy(update={"db_path": db_path, "log_requests": True})
-    monkeypatch.setattr(app, "ENV", new_env)
-    monkeypatch.setattr(app, "_db_ready", False)
-    monkeypatch.setattr(app, "_THREAD_STATE", {})
-    yield db_path
-    with contextlib.suppress(OSError):
-        os.remove(db_path)
+    """Point the app at a fresh sqlite file and re-init the schema.
+
+    Uses TemporaryDirectory so both the file and its parent dir are
+    cleaned up even if the test errors mid-flight.
+    """
+    with tempfile.TemporaryDirectory(prefix="llmrouter-e2e-") as tmpdir:
+        db_path = os.path.join(tmpdir, f"e2e-{uuid.uuid4().hex}.db")
+        new_env = app.ENV.model_copy(update={"db_path": db_path, "log_requests": True})
+        monkeypatch.setattr(app, "ENV", new_env)
+        monkeypatch.setattr(app, "_db_ready", False)
+        monkeypatch.setattr(app, "_THREAD_STATE", {})
+        yield db_path
 
 
 @pytest.fixture

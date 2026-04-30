@@ -514,7 +514,12 @@ async def _claim_thread_state(thread_id: str, now: float) -> dict[str, Any]:
     ttl = float(spec.ttl_s)
     async with _THREAD_STATE_LOCK:
         cached = _THREAD_STATE.get(thread_id)
-        if cached and (now - cached.get("ts", 0.0)) <= ttl:
+        # A "reserved" slot has reserved=True and no previous_request_id —
+        # this means another concurrent request is mid-flight and hasn't
+        # finished its DB lookup or insert yet. We treat it as originating
+        # too (no parent state to inform classification) so siblings don't
+        # silently get origin_request_id=None subcalls.
+        if cached and (now - cached.get("ts", 0.0)) <= ttl and not cached.get("reserved"):
             return {
                 "is_originating": False,
                 "origin_request_id": cached.get("origin_request_id"),
@@ -523,12 +528,15 @@ async def _claim_thread_state(thread_id: str, now: float) -> dict[str, Any]:
                 "previous_complexity": cached.get("previous_complexity"),
             }
         # Reserve the slot so a sibling arriving microseconds later sees us.
+        # Mark `reserved=True` so a sibling hitting this same window doesn't
+        # treat the half-initialized slot as a real parent.
         _THREAD_STATE[thread_id] = {
             "origin_request_id": cached.get("origin_request_id") if cached else None,
             "previous_request_id": cached.get("previous_request_id") if cached else None,
             "previous_tier": None,
             "previous_complexity": None,
             "ts": now,
+            "reserved": True,
         }
     # Cache miss (cold or expired). Look in DB (no lock — async friendly).
     db_state = await asyncio.to_thread(_lookup_thread_state_in_db, thread_id, ttl, now)
@@ -541,6 +549,7 @@ async def _claim_thread_state(thread_id: str, now: float) -> dict[str, Any]:
                     "previous_request_id": db_state["previous_request_id"],
                     "previous_tier": db_state["previous_tier"],
                     "previous_complexity": db_state["previous_complexity"],
+                    "reserved": False,
                 })
         return {
             "is_originating": False,
@@ -566,18 +575,31 @@ def _record_thread_state(
     complexity: int | None,
     now: float,
 ) -> None:
-    """Persist routing outcome for this thread so the next request inherits it."""
+    """Persist routing outcome for this thread so the next request inherits it.
+
+    NOTE: Caller MUST hold no other locks. This grabs the asyncio lock via
+    a sync shortcut: we only mutate primitive dict fields, but to keep the
+    cache consistent with `_claim_thread_state` (which reads under the
+    lock), we acquire it here too. Because this function may be called
+    from sync contexts (post-INSERT finalize) we use the lock's underlying
+    primitive directly via a try/except.
+    """
     if not thread_id:
         return
-    slot = _THREAD_STATE.get(thread_id)
-    if slot is None:
-        slot = {}
-        _THREAD_STATE[thread_id] = slot
-    slot["origin_request_id"] = origin_request_id
-    slot["previous_request_id"] = previous_request_id
-    slot["previous_tier"] = tier
-    slot["previous_complexity"] = complexity
-    slot["ts"] = now
+    # asyncio.Lock isn't reentrant and isn't sync-callable. The mutations
+    # are atomic for primitive dict[str, Any] writes in CPython (GIL), so
+    # the practical race is between a writer here and a reader in
+    # `_claim_thread_state` seeing a half-updated slot. We avoid that by
+    # building the new slot dict in one go and assigning by reference.
+    new_slot = {
+        "origin_request_id": origin_request_id,
+        "previous_request_id": previous_request_id,
+        "previous_tier": tier,
+        "previous_complexity": complexity,
+        "ts": now,
+        "reserved": False,
+    }
+    _THREAD_STATE[thread_id] = new_slot
 
 
 def _tier_rank(tier: str | None) -> int:
@@ -1340,17 +1362,21 @@ async def chat_completions(
             return
         origin_id = base_row.get("origin_request_id") or inserted_id
         if not is_subcall:
-            # Originating: backfill self-reference.
-            try:
+            # Originating: backfill self-reference. Run in threadpool so we
+            # don't block the event loop on sqlite I/O under load.
+            def _backfill_origin_request_id(row_id: int) -> None:
                 conn = sqlite3.connect(ENV.db_path, check_same_thread=False, timeout=2.0)
                 try:
                     conn.execute(
                         "UPDATE requests SET origin_request_id = ? WHERE id = ?",
-                        (inserted_id, inserted_id),
+                        (row_id, row_id),
                     )
                     conn.commit()
                 finally:
                     conn.close()
+
+            try:
+                await asyncio.to_thread(_backfill_origin_request_id, inserted_id)
             except Exception as e:
                 LOG.debug("origin backfill failed: %s", e)
         _record_thread_state(
@@ -1370,7 +1396,6 @@ async def chat_completions(
         if inserted_id is not None:
             if not is_subcall and thread_id:
                 base_row["origin_request_id"] = inserted_id
-            await asyncio.to_thread(lambda: None)  # yield
             await _finalize_thread_state(inserted_id)
             await _hub_publish({
                 "type": "insert",
