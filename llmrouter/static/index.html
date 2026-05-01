@@ -103,6 +103,31 @@
   .pill.conn-connecting   { color: var(--muted); }
   .pill.conn-reconnecting { color: var(--warn); border-color: var(--warn); }
   .pill.conn-offline      { color: var(--err);  border-color: var(--err); }
+  .pill.version {
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    text-decoration: none;
+  }
+  .pill.version:hover { color: var(--fg); border-color: var(--accent); }
+  .pill.version .ver-sha {
+    margin-left: 6px;
+    color: var(--muted);
+    font-size: 10px;
+    opacity: 0.75;
+  }
+  .pill.version.preview { border-color: var(--warn); color: var(--warn); }
+  header .gh-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    color: var(--muted);
+    text-decoration: none;
+  }
+  header .gh-link:hover { color: var(--fg); background: var(--panel-2); }
+  header .gh-link svg { width: 18px; height: 18px; fill: currentColor; }
 
   /* filter row */
   .filter-row {
@@ -208,7 +233,146 @@
   .row .snippet { color: var(--fg); overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .row .meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
   .row.secret .snippet { color: var(--muted); font-style: italic; }
-  aside {
+
+  /* --- threading tree view --- */
+  .row.thread-head { background: linear-gradient(to bottom, var(--panel) 0%, transparent 100%); }
+  .row.thread-head.expanded { border-bottom-color: transparent; }
+  .row.subcall-step {
+    grid-template-columns: 64px 24px 1fr auto;
+    padding: 6px 20px 6px 44px;
+    border-bottom: 1px dashed var(--border);
+    background: var(--panel);
+    position: relative;
+    font-size: 13px;
+  }
+  .row.subcall-step:hover { background: var(--panel-2); }
+  .row.subcall-step::before {
+    content: "";
+    position: absolute;
+    left: 32px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--border);
+  }
+  .row.subcall-step.last-step::before { bottom: 50%; }
+  .row.subcall-step::after {
+    content: "";
+    position: absolute;
+    left: 32px;
+    top: 50%;
+    width: 10px;
+    height: 2px;
+    background: var(--border);
+  }
+  .row.subcall-step .step-icon {
+    font-size: 14px;
+    line-height: 1.4;
+    text-align: center;
+    color: var(--muted);
+  }
+  .row.subcall-step .step-body {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .row.subcall-step .step-headline {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .row.subcall-step .step-headline .tool-name {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--accent);
+    font-size: 12px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(99, 162, 255, 0.12);
+    margin-right: 6px;
+  }
+  .row.subcall-step .step-headline .step-kind-label {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 6px;
+  }
+  .row.subcall-step .step-preamble {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .row.subcall-step .step-meta {
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .thread-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px;
+    margin-left: 8px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 11px;
+    cursor: pointer;
+    user-select: none;
+    vertical-align: middle;
+  }
+  .thread-chip:hover { border-color: var(--accent); color: var(--fg); }
+  .thread-chip.expanded { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+  .thread-chip.orphan { color: var(--warn); border-color: var(--warn); cursor: default; }
+  .thread-chip.orphan[data-thread] { cursor: pointer; }
+  .thread-chip.orphan:hover { color: var(--warn); }
+  .thread-chip.orphan[data-thread]:hover { border-color: var(--accent); color: var(--fg); }
+  /* Upstream-status badge.
+     Local-tier failures = error (user-actionable: their own Ollama).
+     Cloud-tier failures = warning (provider-side; bot will likely retry). */
+  .upstream-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 7px;
+    margin-left: 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    vertical-align: middle;
+  }
+  .upstream-badge.warn  { color: var(--warn); border-color: var(--warn); }
+  .upstream-badge.error { color: var(--err);  border-color: var(--err); background: rgba(248, 81, 73, 0.08); font-weight: 600; }
+  .row.upstream-error   { border-left: 3px solid var(--err); }
+  .row.upstream-warn    { border-left: 3px solid var(--warn); }
+  .retry-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 7px;
+    margin-left: 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+    border: 1px solid var(--muted);
+    color: var(--muted);
+    vertical-align: middle;
+  }
+  #thread-view-toggle.active, #originating-only-toggle.active {
+    background: var(--accent);
+    color: #0d1117;
+    border-color: var(--accent);
+  }
+  aside{
     padding: 16px 20px;
     overflow-y: auto;
     min-height: calc(100vh - 54px);
@@ -294,7 +458,10 @@
   <h1>llmrouter <span class="muted">— request log</span></h1>
   <div class="search">
     <input id="q" type="search" placeholder="search keywords / messages (e.g. python sonnet refactor)" autocomplete="off" />
-    <button id="refresh" title="refresh" aria-label="refresh">↻</button>
+    <a id="version-pill" class="pill version hide" target="_blank" rel="noopener" title="">v?</a>
+    <a class="gh-link" href="https://github.com/dantebarbieri/llmrouter" target="_blank" rel="noopener" title="View source on GitHub" aria-label="GitHub repository">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
     <button id="logout" title="clear stored API key" aria-label="clear stored API key">⎋</button>
     <span id="conn-pill" class="pill conn-connecting" title="">● connecting…</span>
   </div>
@@ -325,6 +492,8 @@
   </select>
   <input type="datetime-local" id="custom-since" class="hide" title="from" />
   <input type="datetime-local" id="custom-until" class="hide" title="to" />
+  <button id="thread-view-toggle" title="group sub-calls under their originating request" type="button">tree</button>
+  <button id="originating-only-toggle" title="hide sub-calls; show only originating requests" type="button">originating only</button>
   <button id="filter-clear" title="clear all filters">clear</button>
 </div>
 
@@ -376,6 +545,9 @@ const state = {
   connStatus: "connecting", // connecting | live | reconnecting | offline
   lastSuccess: 0,
   reasonsSeen: new Set(),   // populated from list results + stats
+  threadView: true,        // groups expanded by default; uncheck = collapsed by default
+  expandedThreads: new Set(),  // explicit expansions when threadView is OFF
+  collapsedThreads: new Set(), // explicit collapses when threadView is ON
   filters: {
     q: "",
     tiers: new Set(),
@@ -387,6 +559,7 @@ const state = {
     since: "",        // "" | seconds | "custom"
     customSince: "",  // datetime-local value
     customUntil: "",
+    originatingOnly: false,
   },
 };
 
@@ -402,6 +575,48 @@ function relTime(ts) {
 function tierChip(t) {
   const cls = "tier-" + (t || "none");
   return `<span class="chip ${cls}">${t || "—"}</span>`;
+}
+// Severity classification for upstream HTTP status. We only flag failures.
+//   - status >= 500 OR status in {408, 429}, AND tier kind == 'local'  → error
+//   - status >= 400 (other 4xx) AND local                              → error
+//   - any non-2xx, cloud                                                → warn
+//   - 2xx or null                                                       → null
+function upstreamSeverity(status, providerKind) {
+  if (status == null) return null;
+  if (status < 400) return null;
+  return providerKind === "local" ? "error" : "warn";
+}
+function upstreamLabel(status) {
+  if (status == null) return "";
+  if (status >= 500) return `HTTP ${status} upstream error`;
+  if (status === 429) return `HTTP 429 rate-limited`;
+  if (status === 408) return `HTTP 408 timeout`;
+  if (status >= 400) return `HTTP ${status} bad request`;
+  return `HTTP ${status}`;
+}
+function upstreamBadgeHtml(status, providerKind) {
+  const sev = upstreamSeverity(status, providerKind);
+  if (!sev) return "";
+  const label = upstreamLabel(status);
+  const where = providerKind === "local" ? "local model" : "cloud provider";
+  return ` <span class="upstream-badge ${sev}" title="${escapeHtml(label)} (${where})">⚠ ${status}</span>`;
+}
+// Surface routing/classifier degradation that isn't an HTTP status code:
+// - fallback_applied: chat completion was redirected from a local tier to a
+//   cloud tier because Ollama was unreachable. Treated as an error because
+//   the user can usually fix it locally (start Ollama).
+// - local_classifier_error: classifier path couldn't reach Ollama (or it
+//   timed out / errored). Treated as a warning — routing still happened
+//   via heuristic/haiku, just without the local LLM signal.
+function routingBadgesHtml(r) {
+  const parts = [];
+  if (r.fallback_applied) {
+    parts.push(' <span class="upstream-badge error" title="local tier unreachable; routed to cloud fallback">↯ local unreachable</span>');
+  }
+  if (r.local_classifier_error) {
+    parts.push(` <span class="upstream-badge warn" title="classifier degraded: ${escapeHtml(String(r.local_classifier_error).slice(0, 200))}">⚠ classifier degraded</span>`);
+  }
+  return parts.join("");
 }
 function escapeHtml(s) {
   if (s == null) return "";
@@ -496,6 +711,7 @@ function saveHash() {
   if (f.hasSecret !== null) h.set("has_secret", String(f.hasSecret));
   if (f.isStream !== null)  h.set("is_stream", String(f.isStream));
   if (f.slow)               h.set("slow", "1");
+  if (f.originatingOnly)    h.set("orig_only", "1");
   if (f.since)              h.set("since", f.since);
   if (f.customSince)        h.set("custom_since", f.customSince);
   if (f.customUntil)        h.set("custom_until", f.customUntil);
@@ -514,6 +730,7 @@ function loadHash() {
   f.hasSecret = h.has("has_secret") ? parseInt(h.get("has_secret")) : null;
   f.isStream  = h.has("is_stream")  ? parseInt(h.get("is_stream"))  : null;
   f.slow      = h.get("slow") === "1";
+  f.originatingOnly = h.get("orig_only") === "1";
   f.since     = h.get("since") || "";
   f.customSince = h.get("custom_since") || "";
   f.customUntil = h.get("custom_until") || "";
@@ -560,6 +777,7 @@ function matchesFilters(item) {
   if (f.isStream === 1  && !item.is_stream)         return false;
   if (f.isStream === 0  &&  item.is_stream)         return false;
   if (f.slow && (item.duration_ms || 0) < SLOW_REQ_MS) return false;
+  if (f.originatingOnly && item.thread_role === "subcall") return false;
   // Time filter: only apply the lower bound client-side; the server applies
   // the exact bound on the next full refresh.
   if (f.since && f.since !== "custom") {
@@ -602,7 +820,36 @@ function renderStats() {
   ).join("");
 }
 
-function rowHtml(r) {
+// --- icon helpers ---
+const STEP_ICON_BY_KIND = {
+  tool_result: "🛠",
+  tool_call: "🔧",
+  user_continuation: "💬",
+  assistant_text: "🧠",
+  unknown: "•",
+};
+function iconForStep(s) {
+  if (!s) return "•";
+  const name = (s.tool_name || "").toLowerCase();
+  if (name) {
+    if (/(read|file|fs|cat|view)/.test(name))   return "📄";
+    if (/(write|edit|patch)/.test(name))        return "✏️";
+    if (/(search|grep|find|ripgrep)/.test(name)) return "🔍";
+    if (/(fetch|http|web|wiki|url)/.test(name)) return "🌐";
+    if (/(price|finance|stock|cost)/.test(name)) return "💲";
+    if (/(shell|exec|run|bash|terminal)/.test(name)) return "⌨️";
+    if (/(mcp|wikivoyage)/.test(name))          return "🔌";
+  }
+  return STEP_ICON_BY_KIND[s.kind] || "•";
+}
+function parseSubcallSummary(raw) {
+  if (!raw) return null;
+  if (typeof raw === "object") return raw;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function rowHtml(r, opts = {}) {
+  if (opts.asStep) return subcallStepHtml(r, opts);
   const secret = r.secret_keyword ? "secret" : "";
   const snippet = r.snippet
     ? r.snippet
@@ -616,17 +863,194 @@ function rowHtml(r) {
     r.fallback_applied ? "fallback" : null,
     r.local_complexity != null ? "local=" + r.local_complexity : null,
     r.tiebreaker_digit ? "haiku=" + r.tiebreaker_digit : null,
+    r.parent_tier && r.thread_role === "subcall" ? "parent=" + r.parent_tier : null,
   ].filter(Boolean).join(" · ");
+  const isHead = r.thread_role === "originating" && opts.subcallCount;
+  const isOrphan = !!opts.orphan;
+  const orphanHasChildren = isOrphan && opts.subcallCount > 0;
+  const expanded = (isHead || orphanHasChildren) && isThreadExpanded(r.thread_id);
+  const threadClass = r.thread_role
+    ? (r.thread_role === "subcall" ? "subcall" : "originating")
+    : "";
+  const headClass = (isHead || orphanHasChildren) ? "thread-head" + (expanded ? " expanded" : "") : "";
+  let threadChip = "";
+  if (isHead) {
+    threadChip = ` <span class="thread-chip${expanded ? " expanded" : ""}" data-thread="${escapeHtml(r.thread_id)}" title="${expanded ? "collapse" : "expand"} ${opts.subcallCount} sub-call${opts.subcallCount === 1 ? "" : "s"}">${expanded ? "▾" : "▸"} ${opts.subcallCount} step${opts.subcallCount === 1 ? "" : "s"}</span>`;
+  } else if (isOrphan) {
+    const count = opts.subcallCount || 0;
+    const countLabel = count > 0 ? `, +${count} more step${count === 1 ? "" : "s"}` : "";
+    const toggleAttr = orphanHasChildren ? ` data-thread="${escapeHtml(r.thread_id)}"` : "";
+    threadChip = ` <span class="thread-chip orphan${orphanHasChildren ? (expanded ? " expanded" : "") : ""}"${toggleAttr} title="parent #${opts.originId} not loaded yet${countLabel}">⤴ orphan${count > 0 ? ` ${expanded ? "▾" : "▸"} ${count}` : ""}</span>`;
+  }
+  const sev = upstreamSeverity(r.upstream_status, r.provider_kind);
+  const upstreamBadge = upstreamBadgeHtml(r.upstream_status, r.provider_kind);
+  const routingBadges = routingBadgesHtml(r);
+  const retryBadge = (r.retry_count && r.retry_count > 0)
+    ? ` <span class="retry-badge" title="${r.retry_count} duplicate retry request${r.retry_count === 1 ? "" : "s"} collapsed onto this row">↻ ×${r.retry_count + 1}</span>`
+    : "";
+  // If the row has no upstream HTTP error but the router itself fell back
+  // off a local tier, treat the whole row as an error so the red left
+  // border kicks in. Classifier degradation alone stays a soft warn.
+  const effectiveSev = sev || (r.fallback_applied ? "error" : (r.local_classifier_error ? "warn" : null));
+  const upstreamRowClass = effectiveSev ? ` upstream-${effectiveSev}` : "";
   return `
-    <div class="row ${secret} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+    <div class="row ${secret} ${threadClass} ${headClass}${upstreamRowClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
       <div class="time" title="${escapeHtml(fmtTime(r.ts))}">${relTime(r.ts)} ago</div>
       <div>${tierChip(r.tier)}<div class="meta">${escapeHtml(r.reason || "")}</div></div>
       <div>
-        <div class="snippet">${escapeHtml(snippet)}</div>
+        <div class="snippet">${escapeHtml(snippet)}${threadChip}${upstreamBadge}${routingBadges}${retryBadge}</div>
         <div class="meta">${escapeHtml(meta)}</div>
       </div>
       <div class="meta">#${r.id}</div>
     </div>`;
+}
+
+function subcallStepHtml(r, opts = {}) {
+  const summary = parseSubcallSummary(r.subcall_summary);
+  const icon = iconForStep(summary);
+  const kindLabel = summary
+    ? (summary.tool_name
+        ? null
+        : (summary.kind === "user_continuation" ? "user"
+           : summary.kind === "assistant_text" ? "assistant"
+           : summary.kind === "tool_call" ? "tool call"
+           : summary.kind || "step"))
+    : null;
+  const headlineParts = [];
+  if (kindLabel) {
+    headlineParts.push(`<span class="step-kind-label">${escapeHtml(kindLabel)}</span>`);
+  }
+  if (summary && summary.tool_name) {
+    headlineParts.push(`<span class="tool-name">${escapeHtml(summary.tool_name)}</span>`);
+  }
+  const summaryText = summary && summary.summary
+    ? summary.summary
+    : (r.snippet || "");
+  if (summaryText) {
+    headlineParts.push(escapeHtml(summaryText));
+  } else if (!summary) {
+    headlineParts.push('<span class="meta">(no summary)</span>');
+  }
+  const preamble = summary && summary.agent_says
+    ? `<div class="step-preamble" title="${escapeHtml(summary.agent_says)}">${escapeHtml(summary.agent_says)}</div>`
+    : "";
+  const stepMeta = [
+    r.approx_tokens != null ? r.approx_tokens + " tok" : null,
+    r.duration_ms   != null ? r.duration_ms   + " ms"  : null,
+    "#" + r.id,
+  ].filter(Boolean).join(" · ");
+  const lastClass = opts.lastStep ? " last-step" : "";
+  const stepSev = upstreamSeverity(r.upstream_status, r.provider_kind);
+  const upstreamBadge = upstreamBadgeHtml(r.upstream_status, r.provider_kind);
+  const routingBadges = routingBadgesHtml(r);
+  const effectiveSev = stepSev || (r.fallback_applied ? "error" : (r.local_classifier_error ? "warn" : null));
+  const upstreamRowClass = effectiveSev ? ` upstream-${effectiveSev}` : "";
+  return `
+    <div class="row subcall-step${lastClass}${upstreamRowClass} ${r.id === state.selectedId ? "selected" : ""}" data-id="${r.id}">
+      <div>${tierChip(r.tier)}</div>
+      <div class="step-icon">${icon}</div>
+      <div class="step-body">
+        <div class="step-headline">${headlineParts.join(" ")}${upstreamBadge}${routingBadges}</div>
+        ${preamble}
+      </div>
+      <div class="step-meta">${escapeHtml(stepMeta)}</div>
+    </div>`;
+}
+
+// Group rows for tree-view rendering: every sub-call lives under its
+// originating row (sub-calls are NEVER rendered standalone in the main list
+// when they have an origin). Originating rows always show a "N steps" chip
+// when sub-calls exist; clicking the chip toggles the group open/closed.
+//
+// Defaults:
+//   - state.threadView = true  → groups are expanded by default; explicit
+//     collapses live in state.collapsedThreads.
+//   - state.threadView = false → groups are collapsed by default; explicit
+//     expansions live in state.expandedThreads.
+// The selected row's thread is always considered expanded so the user sees
+// context around their selection.
+function isThreadExpanded(tid) {
+  const sel = state.selectedId != null
+    ? state.rows.find(r => r.id === state.selectedId)
+    : null;
+  if (sel && sel.thread_id === tid) return true;
+  if (state.threadView) return !state.collapsedThreads.has(tid);
+  return state.expandedThreads.has(tid);
+}
+
+function toggleThread(tid) {
+  if (state.threadView) {
+    if (state.collapsedThreads.has(tid)) state.collapsedThreads.delete(tid);
+    else state.collapsedThreads.add(tid);
+  } else {
+    if (state.expandedThreads.has(tid)) state.expandedThreads.delete(tid);
+    else state.expandedThreads.add(tid);
+  }
+}
+
+function buildTreeView(visible) {
+  // First pass: collect originating rows + sub-calls for every thread that
+  // appears in the visible window. Visible is newest-first, so a sub-call
+  // typically appears BEFORE its originating row.
+  const byThread = new Map(); // thread_id -> { originating, subcalls: [] }
+  for (const r of visible) {
+    if (!r.thread_id) continue;
+    let grp = byThread.get(r.thread_id);
+    if (!grp) {
+      grp = { originating: null, subcalls: [] };
+      byThread.set(r.thread_id, grp);
+    }
+    if (r.thread_role === "originating") {
+      grp.originating = r;
+    } else if (r.thread_role === "subcall") {
+      grp.subcalls.push(r);
+    }
+  }
+
+  // Second pass: walk visible newest-first and emit each thread once,
+  // anchored at its originating row's position. Sub-calls are NEVER
+  // emitted standalone when their originating row is in the visible set.
+  // Orphaned sub-calls (originator not loaded) render at the position of
+  // their newest sub-call so the user still sees the activity; we trigger
+  // a background fetch so on the next render they get reparented.
+  const order = [];
+  const emittedThreads = new Set();
+  const orphanFetched = new Set();
+  for (const r of visible) {
+    if (!r.thread_id) {
+      order.push({ kind: "single", item: r });
+      continue;
+    }
+    const grp = byThread.get(r.thread_id);
+    if (emittedThreads.has(r.thread_id)) continue;
+    if (grp && grp.originating) {
+      // Only emit once we hit the originating row (or right away if the
+      // originating row is the first thread member we see going newest-first
+      // — i.e., the originating row is itself in the visible window). To
+      // keep ordering predictable and avoid surprising the user when a
+      // sub-call is newer than its originator, anchor the group at the
+      // originator's position in the list.
+      if (r.id !== grp.originating.id) continue;
+      emittedThreads.add(r.thread_id);
+      order.push({ kind: "orig", item: grp.originating, group: grp });
+    } else {
+      // No originating row in the visible set: trigger a fetch and, until
+      // it arrives, render this sub-call standalone with a small "orphan"
+      // marker so the user knows what's happening.
+      if (r.thread_role === "subcall" && r.origin_request_id != null
+          && !orphanFetched.has(r.origin_request_id)) {
+        orphanFetched.add(r.origin_request_id);
+        fetchAndInjectRow(r.origin_request_id);
+      }
+      emittedThreads.add(r.thread_id);
+      // Synthesize a placeholder originator-less group so a sub-call still
+      // appears under SOME header rather than naked in the main tree.
+      // We render the newest sub-call as the "head" of a stub group whose
+      // children are the remaining sub-calls in the thread.
+      order.push({ kind: "orphan", item: r, group: grp || { originating: null, subcalls: [] } });
+    }
+  }
+  return order;
 }
 
 function renderRows() {
@@ -641,15 +1065,87 @@ function renderRows() {
   }
   summary.textContent = visible.length + " request" + (visible.length === 1 ? "" : "s")
     + (visible.length !== state.rows.length ? ` (of ${state.rows.length} loaded)` : "");
-  rowsEl.innerHTML = visible.map(rowHtml).join("");
+  // Sub-calls always live inside their originator's group — never standalone.
+  const tree = buildTreeView(visible);
+  const parts = [];
+  for (const node of tree) {
+    if (node.kind === "orig") {
+      const expanded = isThreadExpanded(node.item.thread_id);
+      parts.push(rowHtml(node.item, { subcallCount: node.group.subcalls.length }));
+      if (expanded) {
+        // Sub-calls render oldest → newest so the trajectory reads
+        // top-to-bottom, even though the parent list is newest-first.
+        const ordered = [...node.group.subcalls].sort((a, b) => a.ts - b.ts || a.id - b.id);
+        ordered.forEach((sub, i) => {
+          parts.push(rowHtml(sub, { asStep: true, lastStep: i === ordered.length - 1 }));
+        });
+      }
+    } else if (node.kind === "orphan") {
+      // Originating row not loaded yet (or filtered out) — render the
+      // orphan sub-call as a synthetic header and the remaining sub-calls
+      // in the thread as nested steps so nothing in the thread is naked.
+      const grp = node.group || { subcalls: [] };
+      const expanded = isThreadExpanded(node.item.thread_id);
+      const others = grp.subcalls.filter(s => s.id !== node.item.id);
+      parts.push(rowHtml(node.item, {
+        orphan: true,
+        originId: node.item.origin_request_id,
+        subcallCount: others.length,
+      }));
+      if (expanded && others.length) {
+        const ordered = [...others].sort((a, b) => a.ts - b.ts || a.id - b.id);
+        ordered.forEach((sub, i) => {
+          parts.push(rowHtml(sub, { asStep: true, lastStep: i === ordered.length - 1 }));
+        });
+      }
+    } else {
+      parts.push(rowHtml(node.item));
+    }
+  }
+  rowsEl.innerHTML = parts.join("");
   for (const el of rowsEl.querySelectorAll(".row")) {
-    el.onclick = () => selectRow(parseInt(el.dataset.id));
+    el.onclick = (ev) => {
+      // Clicking the thread chip toggles the group; don't also select.
+      if (ev.target.classList.contains("thread-chip")) return;
+      selectRow(parseInt(el.dataset.id));
+    };
+  }
+  for (const chip of rowsEl.querySelectorAll(".thread-chip")) {
+    chip.onclick = (ev) => {
+      ev.stopPropagation();
+      const tid = chip.dataset.thread;
+      if (!tid) return;
+      toggleThread(tid);
+      renderRows();
+    };
   }
   renderStats();
 }
 
 // --- list state mutation ---
 function upsertRow(item) {
+  // Retries collapse onto the head: don't add the duplicate to the list,
+  // just bump the head's retry_count locally so the badge updates live.
+  if (item.retry_of != null) {
+    const headIdx = state.rows.findIndex(r => r.id === item.retry_of);
+    if (headIdx >= 0) {
+      const head = state.rows[headIdx];
+      state.rows[headIdx] = {
+        ...head,
+        retry_count: (head.retry_count || 0) + 1,
+      };
+      if (item.id > state.maxId) state.maxId = item.id;
+      return;
+    }
+    // Head not loaded yet — pull it in. The list query already filters
+    // retries out of the historical window, so this is the only path
+    // by which the head ever appears.
+    if (!state.rows.some(r => r.id === item.retry_of)) {
+      fetchAndInjectRow(item.retry_of);
+    }
+    if (item.id > state.maxId) state.maxId = item.id;
+    return;
+  }
   const idx = state.rows.findIndex(r => r.id === item.id);
   if (idx >= 0) {
     state.rows[idx] = { ...state.rows[idx], ...item };
@@ -665,6 +1161,37 @@ function upsertRow(item) {
   }
   if (item.id > state.maxId) state.maxId = item.id;
   if (item.reason) state.reasonsSeen.add(item.reason);
+  // If this is a sub-call whose originating row isn't in our local cache
+  // (e.g., the WS publish for the origin was missed during a brief
+  // disconnect, or the origin pre-dates our backfill window), pull it in
+  // so the tree view stays consistent and the originating row is reachable.
+  if (item.thread_role === "subcall"
+      && item.origin_request_id != null
+      && !state.rows.some(r => r.id === item.origin_request_id)) {
+    fetchAndInjectRow(item.origin_request_id);
+  }
+}
+
+const _pendingOriginFetches = new Set();
+async function fetchAndInjectRow(id) {
+  if (_pendingOriginFetches.has(id)) return;
+  _pendingOriginFetches.add(id);
+  try {
+    const r = await api("/ui/api/requests/" + id);
+    // The detail endpoint returns the raw DB row; the list renderer expects
+    // a `snippet` field. Synthesize it so the row renders correctly.
+    const item = {
+      ...r,
+      snippet: r.messages_preview ? String(r.messages_preview).slice(0, 240) : "",
+    };
+    upsertRow(item);
+    renderRows();
+    saveCache();
+  } catch (e) {
+    console.warn("origin backfill for", id, "failed:", e);
+  } finally {
+    _pendingOriginFetches.delete(id);
+  }
 }
 
 function removeRow(id) {
@@ -685,12 +1212,23 @@ function flag(label, value, hintWhenTrue) {
 
 async function selectRow(id) {
   state.selectedId = id;
+  // Re-render so the selected row's thread auto-expands inline (even when
+  // the global tree-view toggle is off) and so the .selected class stays in
+  // sync if the tree restructure caused row remounting.
+  renderRows();
   document.querySelectorAll(".row").forEach(el => {
     el.classList.toggle("selected", parseInt(el.dataset.id) === id);
   });
   try {
     const r = await api("/ui/api/requests/" + id);
     renderDetail(r);
+    // If the selected row is a sub-call but its origin is missing locally,
+    // pull it in so the auto-expanded tree shows the originating ask.
+    if (r.thread_role === "subcall"
+        && r.origin_request_id != null
+        && !state.rows.some(row => row.id === r.origin_request_id)) {
+      fetchAndInjectRow(r.origin_request_id);
+    }
   } catch (e) {
     document.getElementById("detail").innerHTML =
       `<div class="empty err">${escapeHtml(e.message)}</div>`;
@@ -759,6 +1297,19 @@ function renderDetail(r) {
   const deleteLabel = r.secret_keyword ? "Delete (contains secret)" : "Delete";
   const deleteClass = r.secret_keyword ? "delete-btn secret" : "delete-btn";
 
+  const threadingSection = r.thread_id ? `
+    <div class="section">
+      <h3>Threading</h3>
+      <div class="kv">
+        ${kv("role", `<code>${escapeHtml(r.thread_role || "—")}</code>`)}
+        ${kv("thread_id", `<code style="word-break:break-all">${escapeHtml(r.thread_id)}</code>`)}
+        ${r.origin_request_id ? kv("origin", `<a href="#" data-jump="${r.origin_request_id}">#${r.origin_request_id}</a>`) : ""}
+        ${r.parent_tier ? kv("parent tier", tierChip(r.parent_tier)) : ""}
+        ${r.parent_complexity != null ? kv("parent complexity", `<b>${r.parent_complexity}</b>`) : ""}
+      </div>
+    </div>
+  ` : "";
+
   document.getElementById("detail").innerHTML = `
     <h2>Request #${r.id} ${tierChip(r.tier)}</h2>
     <div class="kv">
@@ -767,10 +1318,22 @@ function renderDetail(r) {
       ${kv("target", `<code>${escapeHtml(r.target_model || "—")}</code>`)}
       ${kv("reason", `<code>${escapeHtml(r.reason || "—")}</code>`)}
       ${kv("duration", (r.duration_ms == null ? "—" : r.duration_ms + " ms"))}
-      ${kv("upstream", r.upstream_status || "—")}
+      ${kv("upstream", (() => {
+        if (r.upstream_status == null) return "—";
+        const sev = upstreamSeverity(r.upstream_status, r.provider_kind);
+        if (!sev) return String(r.upstream_status);
+        const label = upstreamLabel(r.upstream_status);
+        const where = r.provider_kind === "local"
+          ? "your local model (Ollama). Check that the model is loaded and responsive."
+          : "the cloud provider. Likely transient / rate limit; the bot may retry.";
+        const cls = sev === "error" ? "err" : "";
+        return `<span class="${cls}" title="${escapeHtml(where)}"><b>${r.upstream_status}</b> — ${escapeHtml(label)} (${r.provider_kind || "unknown"})</span>`;
+      })())}
       ${kv("stream", r.is_stream ? "yes" : "no")}
       ${kv("fallback", r.fallback_applied ? '<span class="err">yes (ollama unreachable)</span>' : "no")}
     </div>
+
+    ${threadingSection}
 
     <div class="section">
       <h3>Classification signals</h3>
@@ -809,6 +1372,12 @@ function renderDetail(r) {
       state.filters.q = el.dataset.kw;
       saveHash();
       refreshAll();
+    };
+  });
+  document.querySelectorAll("#detail a[data-jump]").forEach(el => {
+    el.onclick = (ev) => {
+      ev.preventDefault();
+      selectRow(parseInt(el.dataset.jump));
     };
   });
   document.getElementById("detail-delete").onclick = () => deleteSelected(r);
@@ -1077,6 +1646,7 @@ function clearFilters() {
     q: "", tiers: new Set(), reasons: new Set(),
     fallback: null, hasSecret: null, isStream: null,
     slow: false, since: "", customSince: "", customUntil: "",
+    originatingOnly: false,
   };
   document.getElementById("q").value = "";
   document.getElementById("since").value = "";
@@ -1084,11 +1654,20 @@ function clearFilters() {
   document.getElementById("custom-until").value = "";
   document.getElementById("custom-since").classList.add("hide");
   document.getElementById("custom-until").classList.add("hide");
+  state.expandedThreads.clear();
   renderTierOptions();
   renderReasonOptions();
   renderToggles();
+  renderThreadingToggles();
   saveHash();
   refreshList();
+}
+
+function renderThreadingToggles() {
+  const tv = document.getElementById("thread-view-toggle");
+  const oo = document.getElementById("originating-only-toggle");
+  if (tv) tv.classList.toggle("active", !!state.threadView);
+  if (oo) oo.classList.toggle("active", !!state.filters.originatingOnly);
 }
 
 // --- wire events ---
@@ -1099,11 +1678,33 @@ const debouncedSearch = debounce(() => {
 }, 250);
 
 document.getElementById("q").addEventListener("input", debouncedSearch);
-document.getElementById("refresh").addEventListener("click", () => refreshAll());
 document.getElementById("logout").addEventListener("click", logout);
 document.getElementById("filter-clear").addEventListener("click", clearFilters);
 document.getElementById("login-go").addEventListener("click", tryUnlock);
 document.getElementById("login-key").addEventListener("keydown", e => { if (e.key === "Enter") tryUnlock(); });
+
+const threadViewToggle = document.getElementById("thread-view-toggle");
+if (threadViewToggle) {
+  threadViewToggle.addEventListener("click", () => {
+    state.threadView = !state.threadView;
+    // Switching modes resets per-thread overrides so the new default
+    // applies cleanly across the visible list.
+    state.expandedThreads.clear();
+    state.collapsedThreads.clear();
+    renderThreadingToggles();
+    renderRows();
+  });
+}
+const originatingOnlyToggle = document.getElementById("originating-only-toggle");
+if (originatingOnlyToggle) {
+  originatingOnlyToggle.addEventListener("click", () => {
+    state.filters.originatingOnly = !state.filters.originatingOnly;
+    renderThreadingToggles();
+    saveHash();
+    renderRows();
+  });
+}
+renderThreadingToggles();
 
 // Ticks: keep relative timestamps + stale-cache note fresh
 setInterval(() => {
@@ -1125,9 +1726,40 @@ wireSince();
 renderStatusPill();
 renderRows();
 
+async function loadVersion() {
+  try {
+    const r = await fetch("/ui/api/version");
+    if (!r.ok) return;
+    const v = await r.json();
+    const pill = document.getElementById("version-pill");
+    if (!pill) return;
+    const ver = v.version || "?";
+    const sha = v.git_sha_short || "";
+    const isPreview = /^pr-/i.test(ver) || /^preview-/i.test(ver) || /-(dev|dirty)/i.test(ver);
+    const display = ver.startsWith("v") || /^pr-/.test(ver) || /^preview-/.test(ver) ? ver : "v" + ver;
+    pill.innerHTML = escapeHtml(display) + (sha ? `<span class="ver-sha">${escapeHtml(sha)}</span>` : "");
+    const titleParts = [
+      "version: " + ver,
+      v.git_sha ? "commit: " + v.git_sha : null,
+      v.ref ? "ref: " + v.ref : null,
+      "click to view on GitHub",
+    ].filter(Boolean);
+    pill.title = titleParts.join("\n");
+    pill.classList.toggle("preview", isPreview);
+    pill.href = v.git_sha
+      ? `${v.repo_url || "https://github.com/dantebarbieri/llmrouter"}/commit/${v.git_sha}`
+      : (v.repo_url || "https://github.com/dantebarbieri/llmrouter");
+    pill.classList.remove("hide");
+  } catch (e) {
+    console.warn("loadVersion failed:", e);
+  }
+}
+loadVersion();
+
 if (!apiKey) {
-  showLogin(false);
+  showLogin(true);
 } else {
+  showLogin(false);
   refreshAll().then(() => wsClient.connect());
 }
 </script>
