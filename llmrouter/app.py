@@ -141,9 +141,18 @@ def _scrub_with_values(text: str, values: list[str], marker: str = "llm_classifi
 
 
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
+    """Return the text of the most recent user message.
+
+    For Open WebUI task wrappers (### Task: headers), returns the user query
+    extracted from the <chat_history> USER: block instead of the task
+    instructions, so classification and display show the actual user intent.
+    Falls back to the raw message text when no user query is extractable.
+    """
     for m in reversed(messages):
         if m.get("role") == "user":
-            return _messages_text([m])
+            raw = _messages_text([m])
+            _, user_query = _detect_owui_task(raw)
+            return user_query if user_query is not None else raw
     return ""
 
 
@@ -165,10 +174,24 @@ def heuristic_tier(body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     h = CFG.heuristic
     messages = body.get("messages", [])
     text = _messages_text(messages)
-    latest_user = _latest_user_text(messages)
-    latest_lower = latest_user.lower()
     tokens = _approx_tokens(text)
     has_tools = bool(body.get("tools") or body.get("functions") or body.get("tool_choice"))
+
+    # Detect Open WebUI task wrappers before any keyword/token scoring.
+    # Extract the real user query so step-keyword matching and complexity
+    # scoring use user intent, not task-instruction boilerplate.
+    owui_task_type: str | None = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            raw = _messages_text([m])
+            owui_task_type, owui_query = _detect_owui_task(raw)
+            break
+    else:
+        owui_query = None
+
+    latest_user = owui_query if owui_query is not None else _latest_user_text(messages)
+    latest_lower = latest_user.lower()
+
     hit_secret = regex_secret_hit(body)
     hit_step = next((k for k in h.step_keywords if k in latest_lower), None)
     has_code = "```" in text
@@ -178,9 +201,15 @@ def heuristic_tier(body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
         "has_code": has_code,
         "step_keyword": hit_step,
         "secret_keyword": hit_secret,
+        "owui_task_type": owui_task_type,
     }
     if hit_secret:
         return h.secret_hit_tier, signals
+    # Lightweight OWUI tasks (title/tag/query-analysis/followup) are structurally
+    # simple regardless of token count: always send to the small/local tier and
+    # skip the LLM classifier entirely to save latency and resources.
+    if owui_task_type in _OWUI_LIGHTWEIGHT_TASKS:
+        return h.small_token_tier, signals
     if tokens > h.large_token_threshold:
         return h.large_token_tier, signals
     if has_tools:
@@ -271,6 +300,56 @@ _CLASSIFIER_PROMPT_TEMPLATE = (
 _FENCE_RE = re.compile(r"```(?:json)?\s*|\s*```", re.IGNORECASE)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _JSON_BLOB_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+# --- Open WebUI task detection ---------------------------------------------
+# Open WebUI wraps user requests in structured task prompts (title generation,
+# tag generation, query analysis for RAG, follow-up suggestions, RAG response).
+# These patterns let us (a) extract the original user query from the embedded
+# <chat_history> block for accurate classification and display, (b) fast-route
+# known lightweight tasks directly to the local tier without paying a classifier
+# call, and (c) group all OWUI tasks for the same user turn under one thread.
+
+_OWUI_TASK_HEADER_RE = re.compile(r"^### Task:\n", re.MULTILINE)
+_OWUI_CHAT_HISTORY_USER_RE = re.compile(
+    r"<chat_history>[ \t]*\n(?:.*\n)*?USER:[ \t]*(.*?)(?:\n(?:ASSISTANT:|[ \t]*</chat_history>)|$)",
+    re.DOTALL,
+)
+_OWUI_TASK_TYPES: list[tuple[str, re.Pattern]] = [
+    ("title_generation", re.compile(r"Generate a concise,?\s+\d+-\d+ word title", re.IGNORECASE)),
+    ("tag_generation", re.compile(r"Generate \d+-\d+ broad tags categorizing", re.IGNORECASE)),
+    ("followup_suggestions", re.compile(r"Suggest \d+-\d+ relevant follow-up questions", re.IGNORECASE)),
+    ("query_analysis", re.compile(r"determine the necessity of generating search queries", re.IGNORECASE)),
+    ("rag_response", re.compile(r"Respond to the user query using the provided context", re.IGNORECASE)),
+]
+# Lightweight OWUI tasks that should always route to the small/local tier
+# without incurring a classifier call — they are structurally low-complexity.
+_OWUI_LIGHTWEIGHT_TASKS = frozenset(
+    {"title_generation", "tag_generation", "followup_suggestions", "query_analysis"}
+)
+
+
+def _detect_owui_task(text: str) -> tuple[str | None, str | None]:
+    """Detect an Open WebUI task wrapper in a user message.
+
+    Returns (task_type, extracted_user_query). Both None when not an OWUI task.
+    `task_type` falls back to "owui_task" when the header is present but the
+    specific pattern doesn't match (future OWUI task types). `extracted_user_query`
+    is None when no <chat_history> USER: block is found (e.g., the first turn
+    of a conversation before any history exists).
+    """
+    if not text or not _OWUI_TASK_HEADER_RE.search(text):
+        return None, None
+    header = text[:600]
+    task_type: str | None = None
+    for name, pat in _OWUI_TASK_TYPES:
+        if pat.search(header):
+            task_type = name
+            break
+    if task_type is None:
+        task_type = "owui_task"
+    m = _OWUI_CHAT_HISTORY_USER_RE.search(text)
+    user_query = m.group(1).strip() if m else None
+    return task_type, user_query
 
 _TRUTHY = {True, "1", "true", "True", "TRUE", "yes", "Yes", "YES"}
 _FALSY = {False, "0", "false", "False", "FALSE", "no", "No", "NO"}
@@ -438,7 +517,13 @@ def _extract_thread_id(body: dict[str, Any], header_value: str | None) -> str | 
     """Compute the source-prefixed thread id for this request, or None.
 
     Priority: header → extractor regex list (against the LAST user message
-    only) → fallback hash of (system prompt prefix, latest user prefix).
+    only) → fallback hash of (system prompt prefix, canonical user text).
+
+    For Open WebUI task wrappers the canonical user text is the query extracted
+    from the <chat_history> block, not the task instructions themselves. This
+    causes all OWUI sub-tasks for the same user turn (query_analysis,
+    rag_response, title/tag generation, follow-up suggestions) to share the
+    same thread_id as the originating user request, enabling tree view grouping.
     """
     spec = CFG.threading
     if not spec.enabled:
@@ -448,11 +533,13 @@ def _extract_thread_id(body: dict[str, Any], header_value: str | None) -> str | 
         if cleaned:
             return f"hdr:{cleaned}"
     messages = body.get("messages") or []
-    last_user = _last_user_message_text(messages)
+    last_user_raw = _last_user_message_text(messages)
+    # Extractor regexes run against the raw message (e.g. OpenClaw message_id
+    # is in JSON metadata, not in a task wrapper).
     for ex in spec.extractors:
         if ex.source != "last_user_text":
             continue
-        m = ex.compiled.search(last_user)
+        m = ex.compiled.search(last_user_raw)
         if m and m.group(1):
             return f"{ex.name}:{m.group(1)}"
     if spec.fallback_hash:
@@ -461,8 +548,13 @@ def _extract_thread_id(body: dict[str, Any], header_value: str | None) -> str | 
             if msg.get("role") == "system":
                 sys_text = _messages_text([msg])[:512]
                 break
+        # For OWUI tasks: use the extracted user query so that all tasks for
+        # the same user turn hash to the same digest. For other requests: use
+        # the raw last-user text as before.
+        _, owui_query = _detect_owui_task(last_user_raw)
+        canonical_user = owui_query if owui_query is not None else last_user_raw
         digest = hashlib.sha256(
-            (sys_text + "\x1f" + last_user[:2048]).encode("utf-8", errors="replace")
+            (sys_text + "\x1f" + canonical_user[:2048]).encode("utf-8", errors="replace")
         ).hexdigest()[:24]
         return f"fallback:{digest}"
     return None
@@ -671,10 +763,17 @@ def _build_classification_text(body: dict[str, Any], is_subcall: bool) -> str:
     composed of the original user ask + the trailing message (role-labeled),
     so the classifier scores the *current* sub-step rather than re-scoring
     the original ask via a long history.
+
+    Open WebUI task wrappers are unwrapped to their embedded user query before
+    passing to the classifier, so it scores user intent rather than task
+    boilerplate. For OWUI rag_response tasks the extracted query is used;
+    for lightweight OWUI tasks the heuristic fast-routes before this runs.
     """
     spec = CFG.threading
     messages = body.get("messages") or []
-    user_text = _clean_user_text(_last_user_message_text(messages))
+    # Use _latest_user_text (which extracts OWUI user queries) rather than
+    # _last_user_message_text (which returns the raw message verbatim).
+    user_text = _clean_user_text(_latest_user_text(messages))
     if not is_subcall or not spec.classify_subcall_isolated:
         return user_text
     trailing = _trailing_message(messages)
@@ -757,6 +856,97 @@ def _shorten(text: str, limit: int = _SUMMARY_MAX_CHARS) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _extract_tool_signals(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Scan the message history and return tool-usage signals.
+
+    Handles three tool-call encodings:
+    - OpenAI-style: {role: assistant, tool_calls: [{function: {name, arguments}}]}
+      followed by {role: tool, tool_call_id: ..., content: str}
+    - Anthropic content-list style: assistant content part {type: tool_use, name, input}
+      followed by user content part {type: tool_result}
+    - OpenClaw legacy style: {role: assistant, content: null} (tool name unknown at
+      call time) followed by {role: tool, content: str} where the result JSON may
+      include a "tool" key with the name.
+
+    Returns a dict with:
+      tool_calls_count: int  — total number of tool invocations seen
+      tool_names: list[str]  — deduplicated, sorted tool names (may be partial)
+      tool_error_count: int  — invocations whose result signals an error
+    """
+    tool_calls_count = 0
+    tool_names: list[str] = []
+    tool_error_count = 0
+
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+
+        if role == "assistant":
+            # OpenAI-style: tool_calls list on the message
+            tcs = m.get("tool_calls")
+            if tcs:
+                for tc in tcs:
+                    tool_calls_count += 1
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                    if name:
+                        tool_names.append(name)
+            # Anthropic content-list style
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "tool_use":
+                        tool_calls_count += 1
+                        name = part.get("name")
+                        if name:
+                            tool_names.append(name)
+            # OpenClaw null-content style: assistant turns with no content and
+            # no tool_calls array are placeholder markers for one or more parallel
+            # tool invocations. We count these but the actual call count is
+            # reflected by the subsequent {role: tool} result messages.
+
+        elif role == "tool":
+            # Each {role: tool} message is one resolved tool call. Count these
+            # directly — more accurate than null-assistant markers for OpenClaw,
+            # and also correct for OpenAI-style (where each tool result maps to
+            # one entry in the preceding assistant.tool_calls array).
+            tool_calls_count += 1
+            if isinstance(content, str):
+                # Try to extract tool name and error status from result JSON.
+                # This covers OpenClaw's plain-string tool results which often
+                # embed {"tool": "name", "status": "error"} in the result body.
+                try:
+                    result = json.loads(content)
+                    if isinstance(result, dict):
+                        name = result.get("tool")
+                        if name and isinstance(name, str):
+                            tool_names.append(name)
+                        if result.get("status") == "error":
+                            tool_error_count += 1
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        elif role == "user" and isinstance(content, list):
+            # Anthropic-style tool results embedded in the next user message
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "tool_result":
+                    continue
+                tool_calls_count += 1
+                result_content = part.get("content")
+                if isinstance(result_content, str):
+                    try:
+                        r = json.loads(result_content)
+                        if isinstance(r, dict) and r.get("status") == "error":
+                            tool_error_count += 1
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+    return {
+        "tool_calls_count": tool_calls_count,
+        "tool_names": sorted(set(tool_names)),
+        "tool_error_count": tool_error_count,
+    }
 
 
 def _extract_subcall_summary(
@@ -955,6 +1145,15 @@ _REQUESTS_ADDED_COLUMNS: list[tuple[str, str]] = [
     # row is itself the head, or when dedupe is disabled).
     ("request_hash", "TEXT"),
     ("retry_of", "INTEGER"),
+    # Open WebUI task type detected by _detect_owui_task (e.g. "title_generation",
+    # "query_analysis"). NULL for non-OWUI requests. Used by the UI to label
+    # OWUI sub-tasks distinctly and to explain fast-routing decisions.
+    ("owui_task_type", "TEXT"),
+    # Tool-use signals extracted from the full conversation history.
+    # `tool_calls_count`: total tool invocations in the message array.
+    # `tool_names`: JSON array of deduplicated tool names found in the history.
+    ("tool_calls_count", "INTEGER"),
+    ("tool_names", "TEXT"),
 ]
 
 
@@ -1224,6 +1423,9 @@ def search_requests(
                        requests.subcall_summary,
                        requests.local_classifier_error,
                        requests.retry_of,
+                       requests.owui_task_type,
+                       requests.tool_calls_count,
+                       requests.tool_names,
                        (SELECT COUNT(*) FROM requests r2
                           WHERE r2.retry_of = requests.id) AS retry_count,
                        substr(coalesce(requests.messages_preview, ''), 1, 240) AS snippet
@@ -1382,6 +1584,9 @@ def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
         "provider_kind": _tier_kind(row.get("tier")),
         "retry_of": row.get("retry_of"),
         "retry_count": int(row.get("retry_count") or 0),
+        "owui_task_type": row.get("owui_task_type"),
+        "tool_calls_count": row.get("tool_calls_count"),
+        "tool_names": row.get("tool_names"),
     }
 
 
@@ -1603,6 +1808,9 @@ async def chat_completions(
         )
 
     llm_secret_values = (local_details or {}).get("secret_values") or None
+    # `_latest_user_text` already extracts the real user query from OWUI task
+    # wrappers, so `messages_preview` will show the actual user intent rather
+    # than the task instructions.
     log_text = _clean_user_text(_latest_user_text(body.get("messages", [])))
     messages_preview, keywords_list = _redact_for_log(
         log_text, signals.get("secret_keyword"), llm_secret_values,
@@ -1610,6 +1818,15 @@ async def chat_completions(
     messages_full = _serialize_full_messages(
         body.get("messages", []), signals.get("secret_keyword"), llm_secret_values,
     )
+    # Tool-use signals from the full conversation history (non-secret only;
+    # when a secret is involved we don't parse message content to extract names).
+    _all_messages = body.get("messages", [])
+    if signals.get("secret_keyword"):
+        tool_signals: dict[str, Any] = {"tool_calls_count": 0, "tool_names": [], "tool_error_count": 0}
+    else:
+        tool_signals = _extract_tool_signals(_all_messages)
+    # OWUI task type from heuristic signals (already extracted, reuse it).
+    owui_task_type: str | None = signals.get("owui_task_type")
 
     client = httpx.AsyncClient(timeout=None)
     upstream_req = client.build_request(
@@ -1671,6 +1888,10 @@ async def chat_completions(
         if subcall_summary_obj else None,
         "request_hash": _compute_request_hash(messages_full, requested, thread_id),
         "retry_of": None,
+        "owui_task_type": owui_task_type,
+        "tool_calls_count": tool_signals["tool_calls_count"] or None,
+        "tool_names": json.dumps(tool_signals["tool_names"], ensure_ascii=False)
+        if tool_signals["tool_names"] else None,
     }
 
     async def _finalize_thread_state(inserted_id: int | None) -> None:
