@@ -1,0 +1,13 @@
+# Pinned tool versions for local development.
+#
+# Python 3.11 matches the requires-python floor and ruff's
+# target-version = "py311" so linter behavior locally matches CI's
+# lowest matrix entry.
+#
+# CI tests against 3.11 / 3.12 / 3.13 — override locally with
+# `mise use python@3.12` if you want to reproduce a non-floor failure.
+#
+# Bootstrap: `mise install` then `uv sync --extra dev`.
+
+[tools]
+python = "3.11"
