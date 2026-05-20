@@ -81,10 +81,10 @@ A request can also explicitly request a tier (e.g. `"model": "sonnet"`) to skip 
 ```bash
 git clone https://github.com/dantebarbieri/llmrouter.git
 cd llmrouter
-python -m venv .venv && . .venv/bin/activate    # or .venv\Scripts\activate on Windows
-pip install -e ".[dev]"
-pytest
-ruff check .
+mise install                    # installs the pinned Python from mise.toml
+uv sync --extra dev             # creates .venv and installs runtime + dev deps
+uv run pytest
+uv run ruff check .
 ```
 
 ## Roadmap (known pain points to iterate on)
