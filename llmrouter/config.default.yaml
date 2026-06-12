@@ -183,6 +183,41 @@ hysteresis:
   sticky_pairs:
     - { from_prev: local-thinking, when_now: local, keep: local-thinking }
 
+# Thread-aware UI + routing (issue #1). When `enabled: false` the router
+# behaves exactly as it did before threading was added: thread_id columns
+# stay NULL, parent state lookup is skipped, and chat_id hysteresis still
+# runs. Set `enabled: true` to opt in.
+threading:
+  enabled: false
+  header_name: x-llmrouter-thread-id
+  ttl_s: 1800
+  # parent_tier_policy:
+  #   inform — log parent tier+complexity, but don't change child routing.
+  #   cap    — child tier cannot exceed parent tier.
+  #   ignore — don't even look up parent state.
+  parent_tier_policy: inform
+  # When true and the request is a sub-call, classify against an isolated
+  # text view (original ask + role-labeled trailing message) rather than the
+  # full transcript — so tool-result follow-ups are scored on their own
+  # complexity, not the original ask's.
+  classify_subcall_isolated: true
+  # When true and threading is enabled, the chat_id-based sticky_pairs in
+  # `hysteresis.sticky_pairs` are also applied per-thread.
+  adopt_sticky_pairs: true
+  # Source-prefixed thread-id extractors. First match wins. Each `pattern`
+  # MUST contain exactly one capture group; the captured text is used as
+  # the thread key suffix.
+  extractors:
+    - name: openclaw_message_id
+      source: last_user_text
+      pattern: '"message_id"\s*:\s*"([^"]+)"'
+    - name: cron_task_id
+      source: last_user_text
+      pattern: '\[cron:([a-fA-F0-9-]{8,})'
+  # If no extractor matches, fall back to a stable hash of (system prompt,
+  # latest user message). Set false to leave such requests thread-less.
+  fallback_hash: true
+
 # Health probe + log limits.
 limits:
   health_ttl_s: 5.0

@@ -76,6 +76,21 @@ Two layers:
 
 A request can also explicitly request a tier (e.g. `"model": "sonnet"`) to skip classification, or any other model name to pass through unchanged.
 
+### Thread-aware routing
+
+When `threading.enabled: true`, the router groups tool/sub-call requests under their originating user ask so:
+
+- the UI can render a tree (collapsed sub-calls under the parent row), and
+- the classifier can use parent context as a *signal* — a 4/5 parent doesn't cap a genuinely-5/5 sub-step.
+
+Thread keys are extracted in priority order:
+
+1. `X-LLMRouter-Thread-Id` request header (escape hatch).
+2. Configurable regex extractors against the **last user message** only (so sub-calls in a burst share their originating ask's id, not the conversation's first id). Defaults match OpenClaw `message_id` and `[cron:<uuid> ...]` task tags.
+3. Stable hash of `(system_prompt[:512], latest_user_text[:2048])` when extractors miss (`fallback_hash: true`).
+
+`parent_tier_policy` controls how parent context affects routing: `inform` (default; log only), `cap` (child cannot exceed parent tier), `ignore` (skip parent lookup). With `classify_subcall_isolated: true`, sub-calls are classified against an isolated text view (original ask + role-labeled trailing message) so tool-result follow-ups are scored on their own complexity. Backward compat: omit the `threading:` section and behavior is unchanged from earlier versions.
+
 ## Develop
 
 ```bash
@@ -89,7 +104,6 @@ ruff check .
 
 ## Roadmap (known pain points to iterate on)
 
-- **Thread-aware UI + routing.** Tool calls and reasoning steps from an agent currently appear as separate "user messages" in the UI, and the router classifies each one in isolation. The plan is to group requests by conversation thread, render them as a tree under the originating user ask, and let an individually-complex sub-step **upgrade** above its parent's tier (a 4/5 parent shouldn't cap a 5/5 child). See issue #1.
 - Pluggable classifier backends (HTTP webhook, custom Python entry point).
 - Pluggable storage backends (Postgres for multi-replica deploys).
 - Per-tenant API keys + per-key tier policy.

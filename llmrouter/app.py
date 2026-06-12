@@ -22,13 +22,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import sqlite3
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from importlib import metadata as _imeta
 from pathlib import Path
 from typing import Any
 
@@ -137,9 +141,18 @@ def _scrub_with_values(text: str, values: list[str], marker: str = "llm_classifi
 
 
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
+    """Return the text of the most recent user message.
+
+    For Open WebUI task wrappers (### Task: headers), returns the user query
+    extracted from the <chat_history> USER: block instead of the task
+    instructions, so classification and display show the actual user intent.
+    Falls back to the raw message text when no user query is extractable.
+    """
     for m in reversed(messages):
         if m.get("role") == "user":
-            return _messages_text([m])
+            raw = _messages_text([m])
+            _, user_query = _detect_owui_task(raw)
+            return user_query if user_query is not None else raw
     return ""
 
 
@@ -161,10 +174,24 @@ def heuristic_tier(body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     h = CFG.heuristic
     messages = body.get("messages", [])
     text = _messages_text(messages)
-    latest_user = _latest_user_text(messages)
-    latest_lower = latest_user.lower()
     tokens = _approx_tokens(text)
     has_tools = bool(body.get("tools") or body.get("functions") or body.get("tool_choice"))
+
+    # Detect Open WebUI task wrappers before any keyword/token scoring.
+    # Extract the real user query so step-keyword matching and complexity
+    # scoring use user intent, not task-instruction boilerplate.
+    owui_task_type: str | None = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            raw = _messages_text([m])
+            owui_task_type, owui_query = _detect_owui_task(raw)
+            break
+    else:
+        owui_query = None
+
+    latest_user = owui_query if owui_query is not None else _latest_user_text(messages)
+    latest_lower = latest_user.lower()
+
     hit_secret = regex_secret_hit(body)
     hit_step = next((k for k in h.step_keywords if k in latest_lower), None)
     has_code = "```" in text
@@ -174,9 +201,15 @@ def heuristic_tier(body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
         "has_code": has_code,
         "step_keyword": hit_step,
         "secret_keyword": hit_secret,
+        "owui_task_type": owui_task_type,
     }
     if hit_secret:
         return h.secret_hit_tier, signals
+    # Lightweight OWUI tasks (title/tag/query-analysis/followup) are structurally
+    # simple regardless of token count: always send to the small/local tier and
+    # skip the LLM classifier entirely to save latency and resources.
+    if owui_task_type in _OWUI_LIGHTWEIGHT_TASKS:
+        return h.small_token_tier, signals
     if tokens > h.large_token_threshold:
         return h.large_token_tier, signals
     if has_tools:
@@ -188,8 +221,13 @@ def heuristic_tier(body: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     return CFG.classifier.heuristic_default_tier, signals
 
 
-async def haiku_tiebreaker(body: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
-    text = _messages_text(body.get("messages", []))[:4000]
+async def haiku_tiebreaker(
+    body: dict[str, Any],
+    classification_text: str | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    if classification_text is None:
+        classification_text = _messages_text(body.get("messages", []))
+    text = classification_text[:4000]
     rate_prompt = (
         "Rate the complexity of this request on a 1-5 scale. "
         "1=trivial factual, 2=simple generation, 3=moderate reasoning, "
@@ -262,6 +300,56 @@ _CLASSIFIER_PROMPT_TEMPLATE = (
 _FENCE_RE = re.compile(r"```(?:json)?\s*|\s*```", re.IGNORECASE)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _JSON_BLOB_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+# --- Open WebUI task detection ---------------------------------------------
+# Open WebUI wraps user requests in structured task prompts (title generation,
+# tag generation, query analysis for RAG, follow-up suggestions, RAG response).
+# These patterns let us (a) extract the original user query from the embedded
+# <chat_history> block for accurate classification and display, (b) fast-route
+# known lightweight tasks directly to the local tier without paying a classifier
+# call, and (c) group all OWUI tasks for the same user turn under one thread.
+
+_OWUI_TASK_HEADER_RE = re.compile(r"^### Task:\n", re.MULTILINE)
+_OWUI_CHAT_HISTORY_USER_RE = re.compile(
+    r"<chat_history>[ \t]*\n(?:.*\n)*?USER:[ \t]*(.*?)(?:\n(?:ASSISTANT:|[ \t]*</chat_history>)|$)",
+    re.DOTALL,
+)
+_OWUI_TASK_TYPES: list[tuple[str, re.Pattern]] = [
+    ("title_generation", re.compile(r"Generate a concise,?\s+\d+-\d+ word title", re.IGNORECASE)),
+    ("tag_generation", re.compile(r"Generate \d+-\d+ broad tags categorizing", re.IGNORECASE)),
+    ("followup_suggestions", re.compile(r"Suggest \d+-\d+ relevant follow-up questions", re.IGNORECASE)),
+    ("query_analysis", re.compile(r"determine the necessity of generating search queries", re.IGNORECASE)),
+    ("rag_response", re.compile(r"Respond to the user query using the provided context", re.IGNORECASE)),
+]
+# Lightweight OWUI tasks that should always route to the small/local tier
+# without incurring a classifier call — they are structurally low-complexity.
+_OWUI_LIGHTWEIGHT_TASKS = frozenset(
+    {"title_generation", "tag_generation", "followup_suggestions", "query_analysis"}
+)
+
+
+def _detect_owui_task(text: str) -> tuple[str | None, str | None]:
+    """Detect an Open WebUI task wrapper in a user message.
+
+    Returns (task_type, extracted_user_query). Both None when not an OWUI task.
+    `task_type` falls back to "owui_task" when the header is present but the
+    specific pattern doesn't match (future OWUI task types). `extracted_user_query`
+    is None when no <chat_history> USER: block is found (e.g., the first turn
+    of a conversation before any history exists).
+    """
+    if not text or not _OWUI_TASK_HEADER_RE.search(text):
+        return None, None
+    header = text[:600]
+    task_type: str | None = None
+    for name, pat in _OWUI_TASK_TYPES:
+        if pat.search(header):
+            task_type = name
+            break
+    if task_type is None:
+        task_type = "owui_task"
+    m = _OWUI_CHAT_HISTORY_USER_RE.search(text)
+    user_query = m.group(1).strip() if m else None
+    return task_type, user_query
 
 _TRUTHY = {True, "1", "true", "True", "TRUE", "yes", "Yes", "YES"}
 _FALSY = {False, "0", "false", "False", "FALSE", "no", "No", "NO"}
@@ -375,9 +463,337 @@ def _record_tier(chat_id: str | None, tier: str, now: float) -> None:
         _LAST_TIER_BY_CHAT[chat_id] = (tier, now)
 
 
-async def local_classify(body: dict[str, Any]) -> tuple[bool, int, dict[str, Any]]:
+# --- thread-aware routing (issue #1) ---------------------------------------
+# Public-ish helpers (also unit-tested via tests/test_threading.py):
+#   _sanitize_header_thread_id  : header validation/normalization
+#   _extract_thread_id          : pure function, source-prefixed key
+#   _claim_thread_state         : admission-time race-safe parent lookup
+#   _record_thread_state        : commit thread state after routing decided
+#   _apply_parent_tier_policy   : enforce inform/cap/ignore policy
+#   _apply_thread_sticky        : per-thread sticky-pair downgrade
+#   _build_classification_text  : build sub-call-isolated prompt input
+
+_HEADER_BAD_CHAR_RE = re.compile(r"[^\w\-:.@$+/=]")
+
+# Process-local state cache: thread_id -> {
+#   origin_request_id, previous_request_id, previous_tier, previous_complexity, ts
+# }. Bounded only by `threading.ttl_s` eviction during access.
+_THREAD_STATE: dict[str, dict[str, Any]] = {}
+_THREAD_STATE_LOCK = asyncio.Lock()
+
+
+def _sanitize_header_thread_id(raw: str) -> str | None:
+    """Return a sanitized thread-id from a raw header value, or None.
+
+    Strips control chars, replaces non-safe chars with '_', caps at 128.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    cleaned = _HEADER_BAD_CHAR_RE.sub("_", raw)
+    cleaned = cleaned[:128]
+    return cleaned or None
+
+
+def _last_user_message_text(messages: list[dict[str, Any]]) -> str:
+    """Return the textual content of the most recent user-role message, or ''."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return _messages_text([m])
+    return ""
+
+
+def _trailing_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Last message in the array (any role), or None."""
+    for m in reversed(messages):
+        if m.get("role") in ("user", "assistant", "tool", "function", "system"):
+            return m
+    return messages[-1] if messages else None
+
+
+def _extract_thread_id(body: dict[str, Any], header_value: str | None) -> str | None:
+    """Compute the source-prefixed thread id for this request, or None.
+
+    Priority: header → extractor regex list (against the LAST user message
+    only) → fallback hash of (system prompt prefix, canonical user text).
+
+    For Open WebUI task wrappers the canonical user text is the query extracted
+    from the <chat_history> block, not the task instructions themselves. This
+    causes all OWUI sub-tasks for the same user turn (query_analysis,
+    rag_response, title/tag generation, follow-up suggestions) to share the
+    same thread_id as the originating user request, enabling tree view grouping.
+    """
+    spec = CFG.threading
+    if not spec.enabled:
+        return None
+    if header_value:
+        cleaned = _sanitize_header_thread_id(header_value)
+        if cleaned:
+            return f"hdr:{cleaned}"
+    messages = body.get("messages") or []
+    last_user_raw = _last_user_message_text(messages)
+    # Extractor regexes run against the raw message (e.g. OpenClaw message_id
+    # is in JSON metadata, not in a task wrapper).
+    for ex in spec.extractors:
+        if ex.source != "last_user_text":
+            continue
+        m = ex.compiled.search(last_user_raw)
+        if m and m.group(1):
+            return f"{ex.name}:{m.group(1)}"
+    if spec.fallback_hash:
+        sys_text = ""
+        for msg in messages:
+            if msg.get("role") == "system":
+                sys_text = _messages_text([msg])[:512]
+                break
+        # For OWUI tasks: use the extracted user query so that all tasks for
+        # the same user turn hash to the same digest. For other requests: use
+        # the raw last-user text as before.
+        _, owui_query = _detect_owui_task(last_user_raw)
+        canonical_user = owui_query if owui_query is not None else last_user_raw
+        digest = hashlib.sha256(
+            (sys_text + "\x1f" + canonical_user[:2048]).encode("utf-8", errors="replace")
+        ).hexdigest()[:24]
+        return f"fallback:{digest}"
+    return None
+
+
+def _lookup_thread_state_in_db(
+    thread_id: str, ttl: float, now: float,
+) -> dict[str, Any] | None:
+    """Find the most-recent same-thread row within ttl. Cold-cache fallback."""
+    if not ENV.log_requests:
+        return None
+    try:
+        _init_db()
+        conn = sqlite3.connect(ENV.db_path, check_same_thread=False, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT id, origin_request_id, tier, local_complexity, ts "
+                "FROM requests WHERE thread_id = ? AND ts >= ? "
+                "ORDER BY ts DESC LIMIT 1",
+                (thread_id, now - ttl),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "origin_request_id": row["origin_request_id"] or row["id"],
+                "previous_request_id": row["id"],
+                "previous_tier": row["tier"],
+                "previous_complexity": row["local_complexity"],
+                "ts": row["ts"],
+            }
+        finally:
+            conn.close()
+    except Exception as e:
+        LOG.debug("thread-state DB lookup failed: %s", e)
+        return None
+
+
+async def _claim_thread_state(thread_id: str, now: float) -> dict[str, Any]:
+    """Race-safe admission-time claim. Reserves a slot if cache is empty.
+
+    Returns:
+      {
+        is_originating: bool,
+        origin_request_id: int | None,
+        previous_request_id: int | None,
+        previous_tier: str | None,
+        previous_complexity: int | None,
+      }
+    """
+    spec = CFG.threading
+    ttl = float(spec.ttl_s)
+    async with _THREAD_STATE_LOCK:
+        cached = _THREAD_STATE.get(thread_id)
+        # A "reserved" slot has reserved=True and no previous_request_id —
+        # this means another concurrent request is mid-flight and hasn't
+        # finished its DB lookup or insert yet. We treat it as originating
+        # too (no parent state to inform classification) so siblings don't
+        # silently get origin_request_id=None subcalls.
+        if cached and (now - cached.get("ts", 0.0)) <= ttl and not cached.get("reserved"):
+            return {
+                "is_originating": False,
+                "origin_request_id": cached.get("origin_request_id"),
+                "previous_request_id": cached.get("previous_request_id"),
+                "previous_tier": cached.get("previous_tier"),
+                "previous_complexity": cached.get("previous_complexity"),
+            }
+        # Reserve the slot so a sibling arriving microseconds later sees us.
+        # Mark `reserved=True` so a sibling hitting this same window doesn't
+        # treat the half-initialized slot as a real parent.
+        _THREAD_STATE[thread_id] = {
+            "origin_request_id": cached.get("origin_request_id") if cached else None,
+            "previous_request_id": cached.get("previous_request_id") if cached else None,
+            "previous_tier": None,
+            "previous_complexity": None,
+            "ts": now,
+            "reserved": True,
+        }
+    # Cache miss (cold or expired). Look in DB (no lock — async friendly).
+    db_state = await asyncio.to_thread(_lookup_thread_state_in_db, thread_id, ttl, now)
+    if db_state and (now - db_state["ts"]) <= ttl:
+        async with _THREAD_STATE_LOCK:
+            slot = _THREAD_STATE.get(thread_id)
+            if slot is not None:
+                slot.update({
+                    "origin_request_id": db_state["origin_request_id"],
+                    "previous_request_id": db_state["previous_request_id"],
+                    "previous_tier": db_state["previous_tier"],
+                    "previous_complexity": db_state["previous_complexity"],
+                    "reserved": False,
+                })
+        return {
+            "is_originating": False,
+            "origin_request_id": db_state["origin_request_id"],
+            "previous_request_id": db_state["previous_request_id"],
+            "previous_tier": db_state["previous_tier"],
+            "previous_complexity": db_state["previous_complexity"],
+        }
+    return {
+        "is_originating": True,
+        "origin_request_id": None,
+        "previous_request_id": None,
+        "previous_tier": None,
+        "previous_complexity": None,
+    }
+
+
+def _record_thread_state(
+    thread_id: str | None,
+    origin_request_id: int | None,
+    previous_request_id: int | None,
+    tier: str | None,
+    complexity: int | None,
+    now: float,
+) -> None:
+    """Persist routing outcome for this thread so the next request inherits it.
+
+    NOTE: Caller MUST hold no other locks. This grabs the asyncio lock via
+    a sync shortcut: we only mutate primitive dict fields, but to keep the
+    cache consistent with `_claim_thread_state` (which reads under the
+    lock), we acquire it here too. Because this function may be called
+    from sync contexts (post-INSERT finalize) we use the lock's underlying
+    primitive directly via a try/except.
+    """
+    if not thread_id:
+        return
+    # asyncio.Lock isn't reentrant and isn't sync-callable. The mutations
+    # are atomic for primitive dict[str, Any] writes in CPython (GIL), so
+    # the practical race is between a writer here and a reader in
+    # `_claim_thread_state` seeing a half-updated slot. We avoid that by
+    # building the new slot dict in one go and assigning by reference.
+    new_slot = {
+        "origin_request_id": origin_request_id,
+        "previous_request_id": previous_request_id,
+        "previous_tier": tier,
+        "previous_complexity": complexity,
+        "ts": now,
+        "reserved": False,
+    }
+    _THREAD_STATE[thread_id] = new_slot
+
+
+def _tier_rank(tier: str | None) -> int:
+    """Insertion-order rank from CFG.tiers. Unknown tiers get -1."""
+    if tier is None:
+        return -1
+    for i, name in enumerate(CFG.tiers.keys()):
+        if name == tier:
+            return i
+    return -1
+
+
+def _tier_kind(tier: str | None) -> str | None:
+    """Return 'local' or 'cloud' for a tier name, or None if unknown.
+
+    Drives UI severity (local upstream errors are user-actionable so we
+    surface them as errors; cloud upstream errors are warnings).
+    """
+    if not tier:
+        return None
+    spec = CFG.tiers.get(tier)
+    return spec.kind if spec else None
+
+
+def _apply_parent_tier_policy(child_tier: str, parent_tier: str | None) -> str:
+    """Enforce parent_tier_policy from CFG.threading.
+
+    - inform / ignore: child unchanged.
+    - cap: child rank cannot exceed parent rank; if it would, drop to parent.
+    """
+    spec = CFG.threading
+    if not spec.enabled or spec.parent_tier_policy in ("inform", "ignore"):
+        return child_tier
+    if (
+        spec.parent_tier_policy == "cap"
+        and parent_tier
+        and _tier_rank(child_tier) > _tier_rank(parent_tier)
+    ):
+        return parent_tier
+    return child_tier
+
+
+def _apply_thread_sticky(
+    tier: str,
+    parent_state: dict[str, Any] | None,
+    now: float,  # noqa: ARG001 — kept for symmetry with _apply_hysteresis
+) -> str:
+    """Per-thread sticky_pairs adoption (mirrors `_apply_hysteresis`)."""
+    spec = CFG.threading
+    if not spec.enabled or not spec.adopt_sticky_pairs or not parent_state:
+        return tier
+    prev = parent_state.get("previous_tier")
+    if not prev:
+        return tier
+    for sp in CFG.hysteresis.sticky_pairs:
+        if prev == sp.from_prev and tier == sp.when_now:
+            return sp.keep
+    return tier
+
+
+def _build_classification_text(body: dict[str, Any], is_subcall: bool) -> str:
+    """Return the text fed into the local classifier.
+
+    For originating requests this is just the latest user message (cleaned).
+    For sub-calls, when `classify_subcall_isolated` is True, the text is
+    composed of the original user ask + the trailing message (role-labeled),
+    so the classifier scores the *current* sub-step rather than re-scoring
+    the original ask via a long history.
+
+    Open WebUI task wrappers are unwrapped to their embedded user query before
+    passing to the classifier, so it scores user intent rather than task
+    boilerplate. For OWUI rag_response tasks the extracted query is used;
+    for lightweight OWUI tasks the heuristic fast-routes before this runs.
+    """
+    spec = CFG.threading
+    messages = body.get("messages") or []
+    # Use _latest_user_text (which extracts OWUI user queries) rather than
+    # _last_user_message_text (which returns the raw message verbatim).
+    user_text = _clean_user_text(_latest_user_text(messages))
+    if not is_subcall or not spec.classify_subcall_isolated:
+        return user_text
+    trailing = _trailing_message(messages)
+    if trailing is None or trailing.get("role") == "user":
+        return user_text
+    trailing_text = _messages_text([trailing])
+    return (
+        f"Original user ask: {user_text}\n\n"
+        f"Current trailing message (role={trailing.get('role')}): {trailing_text}"
+    )
+
+
+async def local_classify(
+    body: dict[str, Any],
+    classification_text: str | None = None,
+) -> tuple[bool, int, dict[str, Any]]:
     """Ask the local model to classify the request. Returns (has_secret, complexity, details)."""
-    text = _clean_user_text(_latest_user_text(body.get("messages", [])))[:4000]
+    if classification_text is None:
+        classification_text = _clean_user_text(_latest_user_text(body.get("messages", [])))
+    text = classification_text[:4000]
     prompt = _CLASSIFIER_PROMPT_TEMPLATE.format(text=text)
     details: dict[str, Any] = {"prompt": prompt, "response": None, "error": None}
     try:
@@ -407,6 +823,221 @@ async def local_classify(body: dict[str, Any]) -> tuple[bool, int, dict[str, Any
     except Exception as e:
         details["error"] = str(e)
         raise
+
+
+def _content_to_text(content: Any) -> str:
+    """Flatten OpenAI-style message content (str or list-of-parts) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                if isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+                elif isinstance(p.get("content"), str):
+                    parts.append(p["content"])
+            elif isinstance(p, str):
+                parts.append(p)
+        return "\n".join(parts)
+    return str(content)
+
+
+_SUMMARY_MAX_CHARS = 240
+
+
+def _shorten(text: str, limit: int = _SUMMARY_MAX_CHARS) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _extract_tool_signals(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Scan the message history and return tool-usage signals.
+
+    Handles three tool-call encodings:
+    - OpenAI-style: {role: assistant, tool_calls: [{function: {name, arguments}}]}
+      followed by {role: tool, tool_call_id: ..., content: str}
+    - Anthropic content-list style: assistant content part {type: tool_use, name, input}
+      followed by user content part {type: tool_result}
+    - OpenClaw legacy style: {role: assistant, content: null} (tool name unknown at
+      call time) followed by {role: tool, content: str} where the result JSON may
+      include a "tool" key with the name.
+
+    Returns a dict with:
+      tool_calls_count: int  — total number of tool invocations seen
+      tool_names: list[str]  — deduplicated, sorted tool names (may be partial)
+      tool_error_count: int  — invocations whose result signals an error
+    """
+    tool_calls_count = 0
+    tool_names: list[str] = []
+    tool_error_count = 0
+
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+
+        if role == "assistant":
+            # OpenAI-style: tool_calls list on the message
+            tcs = m.get("tool_calls")
+            if tcs:
+                for tc in tcs:
+                    tool_calls_count += 1
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                    if name:
+                        tool_names.append(name)
+            # Anthropic content-list style
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "tool_use":
+                        tool_calls_count += 1
+                        name = part.get("name")
+                        if name:
+                            tool_names.append(name)
+            # OpenClaw null-content style: assistant turns with no content and
+            # no tool_calls array are placeholder markers for one or more parallel
+            # tool invocations. We count these but the actual call count is
+            # reflected by the subsequent {role: tool} result messages.
+
+        elif role == "tool":
+            # Each {role: tool} message is one resolved tool call. Count these
+            # directly — more accurate than null-assistant markers for OpenClaw,
+            # and also correct for OpenAI-style (where each tool result maps to
+            # one entry in the preceding assistant.tool_calls array).
+            tool_calls_count += 1
+            if isinstance(content, str):
+                # Try to extract tool name and error status from result JSON.
+                # This covers OpenClaw's plain-string tool results which often
+                # embed {"tool": "name", "status": "error"} in the result body.
+                try:
+                    result = json.loads(content)
+                    if isinstance(result, dict):
+                        name = result.get("tool")
+                        if name and isinstance(name, str):
+                            tool_names.append(name)
+                        if result.get("status") == "error":
+                            tool_error_count += 1
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        elif role == "user" and isinstance(content, list):
+            # Anthropic-style tool results embedded in the next user message
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "tool_result":
+                    continue
+                tool_calls_count += 1
+                result_content = part.get("content")
+                if isinstance(result_content, str):
+                    try:
+                        r = json.loads(result_content)
+                        if isinstance(r, dict) and r.get("status") == "error":
+                            tool_error_count += 1
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+    return {
+        "tool_calls_count": tool_calls_count,
+        "tool_names": sorted(set(tool_names)),
+        "tool_error_count": tool_error_count,
+    }
+
+
+def _extract_subcall_summary(
+    messages: list[dict[str, Any]],
+    secret_keyword: str | None,
+    llm_secret_values: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Build a compact 'what triggered this LLM call' summary from the
+    most recent message in the conversation history.
+
+    Returns a dict with keys: kind, tool_name, agent_says, summary.
+    None when there's nothing meaningful to display (empty messages, or
+    secret_keyword=='llm_classifier' without scrub values — same gating
+    as _serialize_full_messages).
+    """
+    if not messages:
+        return None
+    if secret_keyword == "llm_classifier" and not llm_secret_values:
+        return None
+
+    regex_scrub = secret_keyword is not None and secret_keyword != "llm_classifier"
+    has_values = bool(llm_secret_values)
+
+    def scrub(s: str) -> str:
+        if not s:
+            return s
+        if regex_scrub:
+            s = _scrub_secrets(s)
+        if has_values:
+            s = _scrub_with_values(s, llm_secret_values or [])
+        return s
+
+    last = messages[-1]
+    role = last.get("role")
+    out: dict[str, Any] = {
+        "kind": role or "unknown",
+        "tool_name": None,
+        "agent_says": None,
+        "summary": "",
+    }
+
+    if role == "tool":
+        tool_call_id = last.get("tool_call_id")
+        tool_name = last.get("name")
+        agent_says = None
+        if not tool_name or tool_call_id:
+            for m in reversed(messages[:-1]):
+                if m.get("role") != "assistant":
+                    continue
+                tcs = m.get("tool_calls") or []
+                matched = None
+                if tool_call_id:
+                    for tc in tcs:
+                        if tc.get("id") == tool_call_id:
+                            matched = tc
+                            break
+                if matched is None and tcs and not tool_call_id:
+                    matched = tcs[0]
+                if matched and not tool_name:
+                    fn = matched.get("function") or {}
+                    tool_name = fn.get("name")
+                if matched is not None:
+                    agent_says = _content_to_text(m.get("content")) or None
+                    break
+        out["kind"] = "tool_result"
+        out["tool_name"] = tool_name or None
+        if agent_says:
+            out["agent_says"] = _shorten(scrub(agent_says), 160)
+        out["summary"] = _shorten(scrub(_content_to_text(last.get("content"))))
+    elif role == "user":
+        out["kind"] = "user_continuation"
+        out["summary"] = _shorten(scrub(_content_to_text(last.get("content"))))
+    elif role == "assistant":
+        text = _content_to_text(last.get("content"))
+        tcs = last.get("tool_calls") or []
+        if tcs and not text:
+            fn = (tcs[0].get("function") or {})
+            out["kind"] = "tool_call"
+            out["tool_name"] = fn.get("name")
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                out["summary"] = _shorten(scrub(args), 160)
+        else:
+            out["kind"] = "assistant_text"
+            out["summary"] = _shorten(scrub(text))
+    else:
+        out["summary"] = _shorten(scrub(_content_to_text(last.get("content"))))
+
+    if not out["summary"] and not out["tool_name"] and not out["agent_says"]:
+        return None
+    return out
 
 
 def _serialize_full_messages(
@@ -488,7 +1119,67 @@ _REQUESTS_ADDED_COLUMNS: list[tuple[str, str]] = [
     ("local_complexity", "INTEGER"),
     ("local_secret", "INTEGER"),
     ("messages_full", "TEXT"),
+    # Threading (issue #1). All NULL when threading.enabled=false.
+    # `thread_id`: opaque source-prefixed key, e.g. `openclaw_message_id:$rus-...`
+    # or `fallback:<sha256>`. Indexed for thread-grouped queries.
+    ("thread_id", "TEXT"),
+    # `origin_request_id`: id of the originating row in the same thread.
+    # Equals the row's own id for originating rows. NULL when thread_id is NULL.
+    ("origin_request_id", "INTEGER"),
+    # `thread_role`: 'originating' | 'subcall'. NULL when thread_id is NULL.
+    ("thread_role", "TEXT"),
+    # Snapshot of the parent's local_complexity at routing time. Logged
+    # under all parent_tier_policy values (informational).
+    ("parent_complexity", "INTEGER"),
+    # Snapshot of the parent's tier at routing time.
+    ("parent_tier", "TEXT"),
+    # Per-row 'what triggered this LLM call' summary (JSON object with
+    # keys: kind, tool_name, agent_says, summary). Populated for sub-calls
+    # so the UI can render a trajectory tree without repeating the user
+    # prompt. NULL for originating rows and pre-threading rows.
+    ("subcall_summary", "TEXT"),
+    # Retry de-duplication. `request_hash` is a stable digest of
+    # (requested_model, thread_id, messages_full); rows with matching hashes
+    # within `RETRY_DEDUPE_WINDOW_S` are treated as retries of the earliest
+    # row in the chain. `retry_of` points at the head row id (NULL when the
+    # row is itself the head, or when dedupe is disabled).
+    ("request_hash", "TEXT"),
+    ("retry_of", "INTEGER"),
+    # Open WebUI task type detected by _detect_owui_task (e.g. "title_generation",
+    # "query_analysis"). NULL for non-OWUI requests. Used by the UI to label
+    # OWUI sub-tasks distinctly and to explain fast-routing decisions.
+    ("owui_task_type", "TEXT"),
+    # Tool-use signals extracted from the full conversation history.
+    # `tool_calls_count`: total tool invocations in the message array.
+    # `tool_names`: JSON array of deduplicated tool names found in the history.
+    ("tool_calls_count", "INTEGER"),
+    ("tool_names", "TEXT"),
 ]
+
+
+# Retries inside this window collapse onto the earliest matching request.
+# OpenClaw's failure-retry bursts fire within ~10s; 5min handles slow chains.
+RETRY_DEDUPE_WINDOW_S = 300.0
+
+
+def _compute_request_hash(
+    messages_full: str | None,
+    requested_model: str | None,
+    thread_id: str | None,
+) -> str | None:
+    """Stable digest used to detect retries of the same request body.
+
+    Returns None when there is no body to hash (e.g., logging disabled).
+    """
+    if not messages_full:
+        return None
+    h = hashlib.sha256()
+    h.update((requested_model or "").encode("utf-8"))
+    h.update(b"\x00")
+    h.update((thread_id or "").encode("utf-8"))
+    h.update(b"\x00")
+    h.update(messages_full.encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 def _migrate_requests_schema(conn: sqlite3.Connection) -> None:
@@ -561,6 +1252,13 @@ def _init_db() -> None:
             END;
         """)
         _migrate_requests_schema(conn)
+        # Thread index — created post-migration so the column exists. IF NOT
+        # EXISTS makes this no-op on subsequent boots.
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_requests_thread_ts "
+                "ON requests(thread_id, ts DESC)"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -578,13 +1276,32 @@ def extract_keywords(text: str, max_n: int = 30) -> list[str]:
 
 
 def log_request(row: dict[str, Any]) -> int | None:
-    """Insert a request row and return its new id, or None if logging is off."""
+    """Insert a request row and return its new id, or None if logging is off.
+
+    Performs retry-of detection inside the same transaction: if `request_hash`
+    is set on the row and a prior row with the same hash exists within the
+    dedupe window, this row's `retry_of` is set to the head of that chain.
+    """
     if not ENV.log_requests:
         return None
     try:
         _init_db()
         conn = sqlite3.connect(ENV.db_path, check_same_thread=False, timeout=5.0)
         try:
+            req_hash = row.get("request_hash")
+            ts = row.get("ts")
+            if req_hash and ts is not None and row.get("retry_of") is None:
+                cutoff = float(ts) - RETRY_DEDUPE_WINDOW_S
+                conn.row_factory = sqlite3.Row
+                prior = conn.execute(
+                    "SELECT id, retry_of FROM requests "
+                    "WHERE request_hash = ? AND ts >= ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (req_hash, cutoff),
+                ).fetchone()
+                if prior is not None:
+                    row["retry_of"] = prior["retry_of"] or prior["id"]
+                conn.row_factory = None
             keys = list(row.keys())
             cur = conn.execute(
                 f"INSERT INTO requests ({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
@@ -630,6 +1347,7 @@ def search_requests(
     since: float | None = None,
     until: float | None = None,
     since_id: int | None = None,
+    include_retries: bool = False,
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -681,6 +1399,8 @@ def search_requests(
         if since_id is not None:
             where.append("requests.id > ?")
             params.append(since_id)
+        if not include_retries:
+            where.append("requests.retry_of IS NULL")
         where_sql = f" WHERE {' AND '.join(where)}" if where else ""
 
         total = int(conn.execute(
@@ -697,17 +1417,36 @@ def search_requests(
                        requests.tiebreaker_digit, requests.classifier_source,
                        requests.local_complexity, requests.local_secret,
                        requests.keywords,
+                       requests.thread_id, requests.origin_request_id,
+                       requests.thread_role, requests.parent_complexity,
+                       requests.parent_tier,
+                       requests.subcall_summary,
+                       requests.local_classifier_error,
+                       requests.retry_of,
+                       requests.owui_task_type,
+                       requests.tool_calls_count,
+                       requests.tool_names,
+                       (SELECT COUNT(*) FROM requests r2
+                          WHERE r2.retry_of = requests.id) AS retry_count,
                        substr(coalesce(requests.messages_preview, ''), 1, 240) AS snippet
                 FROM requests {joins}{where_sql}
                 ORDER BY requests.ts DESC
                 LIMIT ? OFFSET ?""",
             [*params, limit, offset],
         ).fetchall()
+        items: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            # Annotate provider kind so the UI can colour upstream-error
+            # severity (local → error, cloud → warn) without re-deriving
+            # config in JS. Mirrors `_project_list_item` for hub events.
+            d["provider_kind"] = _tier_kind(d.get("tier"))
+            items.append(d)
         return {
             "total": total,
             "limit": limit,
             "offset": offset,
-            "items": [dict(r) for r in rows],
+            "items": items,
         }
     finally:
         conn.close()
@@ -751,6 +1490,9 @@ def stats() -> dict[str, Any]:
 
 _HUB_QUEUE_MAX = 100
 _hub_clients: set[asyncio.Queue] = set()
+# Strong refs to in-flight persist-and-publish background tasks so they're not
+# garbage-collected mid-execution when a streaming response is cancelled.
+_pending_persist_tasks: set[asyncio.Task] = set()
 
 
 async def _hub_publish(event: dict[str, Any]) -> None:
@@ -759,6 +1501,53 @@ async def _hub_publish(event: dict[str, Any]) -> None:
             q.put_nowait(event)
         except asyncio.QueueFull:
             LOG.debug("hub: dropping event for slow client (queue full)")
+
+
+async def _persist_and_publish(
+    base_row: dict[str, Any],
+    is_subcall: bool,
+    thread_id: str | None,
+    t0: float,
+    finalize: Callable[[int | None], Awaitable[None]] | None = None,
+) -> None:
+    """Insert the request row, finalize thread state, and publish a hub event.
+
+    Designed to run as a detached background task so that streaming-response
+    cancellation (e.g., upstream 5xx with caller abort) cannot interrupt the
+    persist-then-publish sequence partway through. Logs and swallows errors.
+    """
+    try:
+        base_row["duration_ms"] = int((time.time() - t0) * 1000)
+        inserted_id = await asyncio.to_thread(log_request, base_row)
+        if inserted_id is None:
+            return
+        if not is_subcall and thread_id:
+            base_row["origin_request_id"] = inserted_id
+        if finalize is not None:
+            with contextlib.suppress(Exception):
+                await finalize(inserted_id)
+        await _hub_publish({
+            "type": "insert",
+            "id": inserted_id,
+            "item": _project_list_item(inserted_id, base_row),
+        })
+    except Exception as e:  # noqa: BLE001 — must not crash the loop
+        LOG.warning("persist_and_publish failed: %s", e)
+
+
+def _spawn_persist(
+    base_row: dict[str, Any],
+    is_subcall: bool,
+    thread_id: str | None,
+    t0: float,
+    finalize: Callable[[int | None], Awaitable[None]] | None = None,
+) -> asyncio.Task:
+    task = asyncio.create_task(
+        _persist_and_publish(base_row, is_subcall, thread_id, t0, finalize),
+    )
+    _pending_persist_tasks.add(task)
+    task.add_done_callback(_pending_persist_tasks.discard)
+    return task
 
 
 def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
@@ -785,6 +1574,19 @@ def _project_list_item(row_id: int, row: dict[str, Any]) -> dict[str, Any]:
         "local_secret": row.get("local_secret"),
         "keywords": row.get("keywords"),
         "snippet": preview[:240] if preview else "",
+        "thread_id": row.get("thread_id"),
+        "origin_request_id": row.get("origin_request_id"),
+        "thread_role": row.get("thread_role"),
+        "parent_complexity": row.get("parent_complexity"),
+        "parent_tier": row.get("parent_tier"),
+        "subcall_summary": row.get("subcall_summary"),
+        "local_classifier_error": row.get("local_classifier_error"),
+        "provider_kind": _tier_kind(row.get("tier")),
+        "retry_of": row.get("retry_of"),
+        "retry_count": int(row.get("retry_count") or 0),
+        "owui_task_type": row.get("owui_task_type"),
+        "tool_calls_count": row.get("tool_calls_count"),
+        "tool_names": row.get("tool_names"),
     }
 
 
@@ -815,6 +1617,34 @@ def _check_auth(authorization: str | None) -> None:
 async def health() -> dict[str, Any]:
     ok = await ollama_healthy()
     return {"status": "ok", "ollama_healthy": ok}
+
+
+def _build_version_info() -> dict[str, Any]:
+    """Resolve build-time identity. Values are set by the Dockerfile via
+    --build-arg, exported as env vars at runtime. In dev (no env) we fall
+    back to package metadata + a "(dev)" sha."""
+    try:
+        pkg_version = _imeta.version("llmrouter")
+    except _imeta.PackageNotFoundError:
+        pkg_version = "0.0.0+unknown"
+    version = os.environ.get("LLMROUTER_VERSION") or pkg_version
+    sha = os.environ.get("LLMROUTER_GIT_SHA") or ""
+    ref = os.environ.get("LLMROUTER_BUILD_REF") or ""
+    return {
+        "version": version,
+        "git_sha": sha,
+        "git_sha_short": sha[:7] if sha else "",
+        "ref": ref,
+        "repo_url": "https://github.com/dantebarbieri/llmrouter",
+    }
+
+
+_VERSION_INFO = _build_version_info()
+
+
+@app.get("/ui/api/version")
+async def get_version() -> dict[str, Any]:
+    return _VERSION_INFO
 
 
 @app.get("/v1/models")
@@ -850,12 +1680,37 @@ async def chat_completions(
 
     heuristic, signals = heuristic_tier(body)
 
+    # Threading: extract thread_id and claim parent state at admission time
+    # (before any I/O so siblings race-safely see each other).
+    thread_spec = CFG.threading
+    thread_header_name = (thread_spec.header_name or "").lower()
+    thread_header_value = request.headers.get(thread_header_name) if thread_header_name else None
+    thread_id = _extract_thread_id(body, thread_header_value)
+    parent_state: dict[str, Any] | None = None
+    is_subcall = False
+    if thread_id:
+        parent_state = await _claim_thread_state(thread_id, t0)
+        is_subcall = not parent_state["is_originating"]
+
+    # Classification text: when threading is enabled and classify_subcall_isolated
+    # is on for sub-calls, isolate the trailing message from the original ask
+    # so the classifier scores the actual sub-step.
+    classify_text: str | None = None
+    if thread_spec.enabled:
+        classify_text = _build_classification_text(body, is_subcall=is_subcall)
+
+    parent_tier_for_log: str | None = (parent_state or {}).get("previous_tier") if is_subcall else None
+    parent_complexity_for_log: int | None = (
+        (parent_state or {}).get("previous_complexity") if is_subcall else None
+    )
+
     if requested == "auto":
         used_local = False
-        if CFG.classifier.mode == "local" and await ollama_healthy():
+        classifier_local_attempted = CFG.classifier.mode == "local"
+        if classifier_local_attempted and await ollama_healthy():
             try:
                 l_secret, l_complex, local_details = await asyncio.wait_for(
-                    local_classify(body),
+                    local_classify(body, classification_text=classify_text),
                     timeout=CFG.classifier.local_timeout_s + 0.5,
                 )
                 local_secret = 1 if l_secret else 0
@@ -878,13 +1733,27 @@ async def chat_completions(
                 else:
                     local_details["error"] = err_str
                 classifier_source = "fallback"
+        elif classifier_local_attempted:
+            # Ollama health check failed before we even tried to classify.
+            # Record this so the UI can flag the row as "classifier
+            # degraded" — without it, the row looks like an intentional
+            # heuristic/haiku call and the user has no signal that a
+            # local provider is unreachable.
+            local_details = {
+                "prompt": None,
+                "response": None,
+                "error": "ollama unreachable (health check failed at classification time)",
+            }
+            classifier_source = "fallback"
 
         if not used_local:
             if heuristic is not None:
                 tier, reason = heuristic, "heuristic"
                 classifier_source = classifier_source or "heuristic"
             elif CFG.classifier.mode in ("hybrid", "haiku", "local"):
-                tier, reason, tiebreaker = await haiku_tiebreaker(body)
+                tier, reason, tiebreaker = await haiku_tiebreaker(
+                    body, classification_text=classify_text,
+                )
                 classifier_source = classifier_source or "haiku_tiebreaker"
             else:
                 tier, reason = CFG.classifier.heuristic_default_tier, "heuristic-default"
@@ -895,6 +1764,18 @@ async def chat_completions(
     else:
         tier, reason = None, "passthrough"
         classifier_source = "passthrough"
+
+    # Threading policy: parent_tier_policy + per-thread sticky pairs.
+    # Both no-op when threading.enabled=false.
+    if thread_id and is_subcall and tier:
+        capped = _apply_parent_tier_policy(tier, parent_tier_for_log)
+        if capped != tier:
+            reason = (reason or "") + "+parent-cap"
+            tier = capped
+        sticky = _apply_thread_sticky(tier, parent_state, time.time())
+        if sticky != tier:
+            reason = (reason or "") + "+thread-sticky"
+            tier = sticky
 
     if classifier_source == "local_model":
         _record_tier(_extract_chat_id(body), tier, time.time())
@@ -909,8 +1790,8 @@ async def chat_completions(
     is_stream = bool(body.get("stream"))
 
     LOG.info(
-        "route tier=%s reason=%s requested=%s target=%s stream=%s fallback=%s",
-        tier, reason, requested, target_model, is_stream, fallback_applied,
+        "route tier=%s reason=%s requested=%s target=%s stream=%s fallback=%s thread=%s",
+        tier, reason, requested, target_model, is_stream, fallback_applied, thread_id,
     )
 
     response_headers = {
@@ -920,8 +1801,16 @@ async def chat_completions(
     }
     if fallback_applied:
         response_headers["x-llmrouter-fallback"] = "ollama-unreachable"
+    if thread_id:
+        response_headers["x-llmrouter-thread-id"] = thread_id
+        response_headers["x-llmrouter-thread-role"] = (
+            "subcall" if is_subcall else "originating"
+        )
 
     llm_secret_values = (local_details or {}).get("secret_values") or None
+    # `_latest_user_text` already extracts the real user query from OWUI task
+    # wrappers, so `messages_preview` will show the actual user intent rather
+    # than the task instructions.
     log_text = _clean_user_text(_latest_user_text(body.get("messages", [])))
     messages_preview, keywords_list = _redact_for_log(
         log_text, signals.get("secret_keyword"), llm_secret_values,
@@ -929,6 +1818,15 @@ async def chat_completions(
     messages_full = _serialize_full_messages(
         body.get("messages", []), signals.get("secret_keyword"), llm_secret_values,
     )
+    # Tool-use signals from the full conversation history (non-secret only;
+    # when a secret is involved we don't parse message content to extract names).
+    _all_messages = body.get("messages", [])
+    if signals.get("secret_keyword"):
+        tool_signals: dict[str, Any] = {"tool_calls_count": 0, "tool_names": [], "tool_error_count": 0}
+    else:
+        tool_signals = _extract_tool_signals(_all_messages)
+    # OWUI task type from heuristic signals (already extracted, reuse it).
+    owui_task_type: str | None = signals.get("owui_task_type")
 
     client = httpx.AsyncClient(timeout=None)
     upstream_req = client.build_request(
@@ -942,6 +1840,16 @@ async def chat_completions(
     )
     upstream = await client.send(upstream_req, stream=is_stream)
 
+    thread_role: str | None = None
+    if thread_id:
+        thread_role = "subcall" if is_subcall else "originating"
+    subcall_summary_obj: dict[str, Any] | None = None
+    if thread_id and is_subcall:
+        subcall_summary_obj = _extract_subcall_summary(
+            body.get("messages", []),
+            signals.get("secret_keyword"),
+            llm_secret_values,
+        )
     base_row: dict[str, Any] = {
         "ts": t0,
         "duration_ms": None,
@@ -971,19 +1879,63 @@ async def chat_completions(
         "keywords": " ".join(keywords_list) if keywords_list else None,
         "messages_preview": messages_preview,
         "messages_full": messages_full,
+        "thread_id": thread_id,
+        "origin_request_id": (parent_state or {}).get("origin_request_id") if is_subcall else None,
+        "thread_role": thread_role,
+        "parent_complexity": parent_complexity_for_log,
+        "parent_tier": parent_tier_for_log,
+        "subcall_summary": json.dumps(subcall_summary_obj, ensure_ascii=False)
+        if subcall_summary_obj else None,
+        "request_hash": _compute_request_hash(messages_full, requested, thread_id),
+        "retry_of": None,
+        "owui_task_type": owui_task_type,
+        "tool_calls_count": tool_signals["tool_calls_count"] or None,
+        "tool_names": json.dumps(tool_signals["tool_names"], ensure_ascii=False)
+        if tool_signals["tool_names"] else None,
     }
+
+    async def _finalize_thread_state(inserted_id: int | None) -> None:
+        """Backfill origin_request_id on originating rows (it == self.id) and
+        update the in-process state cache so siblings see this row."""
+        if not thread_id or inserted_id is None:
+            return
+        origin_id = base_row.get("origin_request_id") or inserted_id
+        if not is_subcall:
+            # Originating: backfill self-reference. Run in threadpool so we
+            # don't block the event loop on sqlite I/O under load.
+            def _backfill_origin_request_id(row_id: int) -> None:
+                conn = sqlite3.connect(ENV.db_path, check_same_thread=False, timeout=2.0)
+                try:
+                    conn.execute(
+                        "UPDATE requests SET origin_request_id = ? WHERE id = ?",
+                        (row_id, row_id),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+            try:
+                await asyncio.to_thread(_backfill_origin_request_id, inserted_id)
+            except Exception as e:
+                LOG.debug("origin backfill failed: %s", e)
+        _record_thread_state(
+            thread_id,
+            origin_request_id=origin_id,
+            previous_request_id=inserted_id,
+            tier=tier,
+            complexity=local_complexity,
+            now=time.time(),
+        )
 
     if not is_stream:
         data = await upstream.aread()
         await client.aclose()
-        base_row["duration_ms"] = int((time.time() - t0) * 1000)
-        inserted_id = await asyncio.to_thread(log_request, base_row)
-        if inserted_id is not None:
-            await _hub_publish({
-                "type": "insert",
-                "id": inserted_id,
-                "item": _project_list_item(inserted_id, base_row),
-            })
+        # Run persist+publish as a shielded background task so that a caller
+        # cancelling the response after we've decided what to log doesn't
+        # leave the row uninserted or unpublished.
+        persist = _spawn_persist(base_row, is_subcall, thread_id, t0, _finalize_thread_state)
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.shield(persist)
         try:
             content = json.loads(data) if data else {}
         except json.JSONDecodeError:
@@ -1001,14 +1953,11 @@ async def chat_completions(
         finally:
             await upstream.aclose()
             await client.aclose()
-            base_row["duration_ms"] = int((time.time() - t0) * 1000)
-            inserted_id = await asyncio.to_thread(log_request, base_row)
-            if inserted_id is not None:
-                await _hub_publish({
-                    "type": "insert",
-                    "id": inserted_id,
-                    "item": _project_list_item(inserted_id, base_row),
-                })
+            # Detach persistence from the streaming generator's lifetime: if
+            # the caller aborts mid-stream (or upstream returned 5xx and the
+            # caller hangs up), our cancellation must not prevent the row
+            # from being inserted and broadcast.
+            _spawn_persist(base_row, is_subcall, thread_id, t0, _finalize_thread_state)
 
     return StreamingResponse(
         iter_chunks(),
@@ -1083,6 +2032,9 @@ async def ui_get_request(
     row = get_request(req_id)
     if not row:
         raise HTTPException(404, "not found")
+    # Annotate with tier→kind so the UI can show error severity for
+    # local-vs-cloud upstream failures without re-deriving config in JS.
+    row["provider_kind"] = _tier_kind(row.get("tier"))
     return row
 
 
